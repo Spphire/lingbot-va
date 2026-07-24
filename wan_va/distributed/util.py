@@ -1,4 +1,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import os
+from datetime import timedelta
+
 import torch
 import torch.distributed as dist
 
@@ -22,12 +25,18 @@ def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True):
 
 
 def init_distributed(world_size, local_rank, rank):
-    # if world_size > 1:
+    timeout_seconds = int(os.getenv("TORCH_DISTRIBUTED_TIMEOUT", "1800"))
+    if timeout_seconds <= 0:
+        raise ValueError("TORCH_DISTRIBUTED_TIMEOUT must be greater than zero")
+
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl",
-                            init_method="env://",
-                            rank=rank,
-                            world_size=world_size)
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=timeout_seconds),
+    )
 
 def dist_mean(local_tensor):
     if dist.is_initialized():

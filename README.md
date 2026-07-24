@@ -415,6 +415,9 @@ Create a hostfile with one private training-network address per node:
 10.0.8.102 slots=8
 ```
 
+Every active host must be unique and its `slots` value must match
+`GPUS_PER_NODE`; the launcher rejects mismatches before starting any workers.
+
 The launch node must have passwordless SSH access to every host, including
 itself. The default launcher uses SSH to start one `torchrun` agent per node and
 does not require `pdsh`. Run the read-only preflight first:
@@ -441,6 +444,34 @@ MODEL_PATH=/path/to/lingbot-va-base \
 SAVE_ROOT=/path/to/output \
 bash script/run_va_multinode.sh
 ```
+
+For a 16-node, 8-GPU-per-node run, keep data-loader workers disabled for the
+initial validation. This avoids forking workers from each of the 128 CUDA
+training processes:
+
+```bash
+HOSTFILE=/path/to/hostfile.16x8 \
+NNODES=16 \
+GPUS_PER_NODE=8 \
+PYTHON_BIN=/path/to/venv/bin/python \
+PRECHECK_ONLY=0 \
+CONFIG_NAME=libero_train \
+DATASET_PATH=/path/to/libero-long-lerobot \
+MODEL_PATH=/path/to/lingbot-va-base \
+SAVE_ROOT=/path/to/output \
+DISABLE_WANDB=1 \
+NUM_WORKERS=0 \
+NUM_INIT_WORKERS=1 \
+TORCH_DISTRIBUTED_TIMEOUT=1800 \
+bash script/run_va_multinode.sh \
+  --gradient-accumulation-steps 1
+```
+
+The SSH launcher writes every rank's stdout and stderr below
+`<save-root>/launcher_logs/<run-id>/node_<rank>/`. Set `RUN_ID` to a stable,
+shell-safe name when logs from separate phases must remain distinct. On a
+node failure or interrupt, the launcher terminates the job-specific remote
+process groups before returning a nonzero status.
 
 Set `DISABLE_WANDB=1` when W&B is not configured. To resume, set
 `RESUME_FROM=/path/to/checkpoints/checkpoint_step_N`; all ranks restore the
