@@ -1,0 +1,3 @@
+# Use each node's private training-network address.
+10.0.8.101 slots=8
+10.0.8.102 slots=8

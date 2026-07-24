@@ -12,7 +12,6 @@ from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
-    get_optimizer_state_dict,
     set_optimizer_state_dict,
     StateDictOptions,
 )
@@ -22,6 +21,11 @@ import json
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from configs import VA_CONFIGS
+from distributed.deepspeed import (
+    materialize_deepspeed_config,
+    prepare_accumulated_losses,
+    validate_distributed_backend,
+)
 from distributed.fsdp import shard_model, apply_ac
 from distributed.util import (
     _configure_model, 
@@ -67,6 +71,13 @@ class Trainer:
         self.device = torch.device(f"cuda:{config.local_rank}")
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
+        self.distributed_backend = validate_distributed_backend(
+            config.distributed_backend
+        )
+        self.deepspeed_engine = None
+        self.gradient_accumulation_steps = int(
+            getattr(config, 'gradient_accumulation_steps', 1)
+        )
 
         # Load models
         logger.info("Loading models...")
@@ -91,15 +102,18 @@ class Trainer:
         logger.info("Setting up activation checkpointing ...")
         apply_ac(self.transformer)
 
-        logger.info("Setting up FSDP...")
-        shard_fn = shard_model
-        self.transformer = _configure_model(
-            model=self.transformer,
-            shard_fn=shard_fn,
-            param_dtype=self.dtype,
-            device=self.device,
-            eval_mode=False,
-        )
+        if self._uses_deepspeed:
+            logger.info("Setting up DeepSpeed model...")
+            self.transformer.to(device=self.device, dtype=self.dtype)
+        else:
+            logger.info("Setting up FSDP...")
+            self.transformer = _configure_model(
+                model=self.transformer,
+                shard_fn=shard_model,
+                param_dtype=self.dtype,
+                device=self.device,
+                eval_mode=False,
+            )
         self.transformer.train()
         self.transformer.requires_grad_(True)
 
@@ -117,9 +131,15 @@ class Trainer:
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, 
             lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps))
 
+        if self._uses_deepspeed:
+            self._initialize_deepspeed_engine()
+
         # Setup dataloaders
         logger.info("Setting up datasets...")
-        train_dataset = MultiLatentLeRobotDataset(config=config)
+        train_dataset = MultiLatentLeRobotDataset(
+            config=config,
+            num_init_worker=config.num_init_worker,
+        )
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=config.world_size,
@@ -143,10 +163,55 @@ class Trainer:
         self.save_dir = Path(config.save_root) / "checkpoints"
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
-        self.gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
         self.train_loader_iter = None
-        # if hasattr(config, 'resume_from') and config.resume_from:
-        #     self._load_training_state(config.resume_from)
+        if hasattr(config, 'resume_from') and config.resume_from:
+            self._load_training_state(config.resume_from)
+
+    @property
+    def _uses_deepspeed(self):
+        return self.distributed_backend == 'deepspeed'
+
+    def _initialize_deepspeed_engine(self):
+        try:
+            import deepspeed
+        except ImportError as exc:
+            raise ImportError(
+                "DeepSpeed backend requested; install with `pip install .[deepspeed]`"
+            ) from exc
+
+        ds_config = materialize_deepspeed_config(
+            self.config.deepspeed_config_file,
+            micro_batch_size=self.config.batch_size,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            world_size=self.config.world_size,
+            param_dtype=self.dtype,
+            gradient_clipping=self.config.gradient_clipping,
+        )
+        engine, optimizer, _, scheduler = deepspeed.initialize(
+            model=self.transformer,
+            model_parameters=[
+                p for p in self.transformer.parameters() if p.requires_grad
+            ],
+            optimizer=self.optimizer,
+            lr_scheduler=self.lr_scheduler,
+            config=ds_config,
+        )
+        self.deepspeed_engine = engine
+        self.transformer = engine
+        self.optimizer = optimizer
+        if scheduler is not None:
+            self.lr_scheduler = scheduler
+        if self.config.rank == 0:
+            logger.info(
+                "DeepSpeed initialized: ZeRO stage %s, global batch size %s",
+                ds_config.get('zero_optimization', {}).get('stage'),
+                ds_config.get('train_batch_size'),
+            )
+
+    def _unwrap_transformer(self):
+        if self.deepspeed_engine is not None:
+            return self.deepspeed_engine.module
+        return self.transformer
     
     def _get_next_batch(self):
         """Get next batch from iterator, reset if epoch is finished."""
@@ -292,7 +357,7 @@ class Trainer:
         action_mask_per_frame = action_mask.sum(dim=1)  # (B*F,)
         action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
 
-        return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps
+        return latent_loss, action_loss
 
     def _train_step(self, batch, batch_idx):
         """Train a single batch, returns losses for logging."""
@@ -300,97 +365,119 @@ class Trainer:
         input_dict = self._prepare_input_dict(batch)
         
         should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
-        
-        if not should_sync:
-            self.transformer.set_requires_gradient_sync(False)
-        else:
-            self.transformer.set_requires_gradient_sync(True)
+        if not self._uses_deepspeed:
+            self.transformer.set_requires_gradient_sync(should_sync)
 
         output = self.transformer(input_dict, train_mode=True)
         latent_loss, action_loss = self.compute_loss(input_dict, output)
-        loss = latent_loss + action_loss
+        loss_payload = prepare_accumulated_losses(
+            latent_loss,
+            action_loss,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            uses_deepspeed=self._uses_deepspeed,
+        )
 
-        loss.backward()
+        losses = {
+            'latent_loss': loss_payload['latent_loss_for_log'].detach(),
+            'action_loss': loss_payload['action_loss_for_log'].detach(),
+        }
 
-        losses = {'latent_loss': latent_loss.detach(), 'action_loss': action_loss.detach()}
-        
-        # Only update weights after accumulating gradients
-        if should_sync:
-            total_norm = torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 2.0)
-            self.optimizer.step()
-            self.lr_scheduler.step()
-            self.optimizer.zero_grad()
-            
-            losses['total_norm'] = total_norm
-            losses['should_log'] = True
+        if self._uses_deepspeed:
+            self.deepspeed_engine.backward(loss_payload['backward_loss'])
+            global_steps_before = int(self.deepspeed_engine.global_steps)
+            self.deepspeed_engine.step()
+            did_step = int(self.deepspeed_engine.global_steps) > global_steps_before
+            losses['should_log'] = did_step
+            if did_step:
+                total_norm = self.deepspeed_engine.get_global_grad_norm()
+                losses['total_norm'] = torch.as_tensor(
+                    0.0 if total_norm is None else total_norm,
+                    device=self.device,
+                )
         else:
-            losses['should_log'] = False
+            loss_payload['backward_loss'].backward()
+            if should_sync:
+                total_norm = torch.nn.utils.clip_grad_norm_(
+                    self.transformer.parameters(),
+                    self.config.gradient_clipping,
+                )
+                self.optimizer.step()
+                self.lr_scheduler.step()
+                self.optimizer.zero_grad()
+                losses['total_norm'] = total_norm
+                losses['should_log'] = True
+            else:
+                losses['should_log'] = False
 
         return losses
 
-    def save_checkpoint(self,):
-        """Save model checkpoint in the same format as pretrained model."""
-        try:
+    def _save_transformer_artifacts(self, checkpoint_dir, state_dict, config):
+        transformer_dir = checkpoint_dir / "transformer"
+        transformer_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Saving transformer to {transformer_dir}")
+        save_file(
+            {k: v.detach().cpu().to(torch.bfloat16) for k, v in state_dict.items()},
+            transformer_dir / "diffusion_pytorch_model.safetensors",
+        )
+        config_dict = dict(config)
+        config_dict.pop('_name_or_path', None)
+        with (transformer_dir / "config.json").open('w', encoding='utf-8') as f:
+            json.dump(config_dict, f, indent=2)
+
+    def save_checkpoint(self):
+        """Save model weights and resumable backend state."""
+        checkpoint_dir = self.save_dir / f"checkpoint_step_{self.step}"
+        if self._uses_deepspeed:
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            self.deepspeed_engine.save_checkpoint(
+                str(checkpoint_dir / 'deepspeed'),
+                tag=f"global_step{self.step}",
+                client_state={'step': self.step},
+            )
+            if self.config.rank == 0:
+                module = self._unwrap_transformer()
+                self._save_transformer_artifacts(
+                    checkpoint_dir,
+                    module.state_dict(),
+                    module.config,
+                )
+        else:
             state_dict = get_model_state_dict(
                 self.transformer,
                 options=StateDictOptions(full_state_dict=True, cpu_offload=True),
             )
-            state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
-            # optim_state = get_optimizer_state_dict(
-            #         self.transformer, self.optimizer,
-            #         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-            #     )
-
-            # Only rank 0 saves the checkpoint
             if self.config.rank == 0:
-                checkpoint_dir = self.save_dir / f"checkpoint_step_{self.step}"
                 checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                self._save_transformer_artifacts(
+                    checkpoint_dir,
+                    state_dict,
+                    self._unwrap_transformer().config,
+                )
 
-                # Save transformer in the same format as pretrained model
-                transformer_dir = checkpoint_dir / "transformer"
-                transformer_dir.mkdir(parents=True, exist_ok=True)
-
-                logger.info(f"Saving transformer to {transformer_dir}")
-
-                # Manually save in diffusers format (outside FSDP context to avoid deadlock)
-                # Save model weights
-                model_file = transformer_dir / "diffusion_pytorch_model.safetensors"
-                save_file(state_dict_bf16, model_file)
-
-                # Save config (copy from original transformer config and update _name_or_path)
-                config_file = transformer_dir / "config.json"
-                config_dict = dict(self.transformer.config)
-                config_dict.pop('_name_or_path', None)
-                with open(config_file, 'w') as f:
-                    json.dump(config_dict, f, indent=2)
-
-                # # Save optimizer state and training metadata in PyTorch format
-                # training_state_path = checkpoint_dir / "training_state.pt"
-                # logger.info(f"Saving training state to {training_state_path}")
-                # torch.save({
-                #     'step': self.step,
-                #     'optimizer_state_dict': optim_state,
-                #     'config': vars(self.config),
-                # }, training_state_path)
-
-                logger.info(f"Checkpoint saved successfully at step {self.step}")
-
-            # Synchronize all processes after saving
-            if dist.is_initialized():
-                dist.barrier()
-
-        except Exception as e:
-            if self.config.rank == 0:
-                logger.error(f"Failed to save checkpoint: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-            # Ensure all processes stay synchronized even on error
-            if dist.is_initialized():
-                dist.barrier()
+        if dist.is_initialized():
+            dist.barrier()
+        if self.config.rank == 0:
+            logger.info(f"Checkpoint saved successfully at step {self.step}")
 
     def _load_training_state(self, checkpoint_path):
-        """Load training state (optimizer + step) after FSDP and optimizer creation."""
+        """Load backend optimizer/scheduler state after model initialization."""
         checkpoint_dir = Path(checkpoint_path)
+        if self._uses_deepspeed:
+            deepspeed_dir = checkpoint_dir / 'deepspeed'
+            load_path, client_state = self.deepspeed_engine.load_checkpoint(
+                str(deepspeed_dir)
+            )
+            if load_path is None:
+                raise FileNotFoundError(
+                    f"DeepSpeed training state not found: {deepspeed_dir}"
+                )
+            self.step = int((client_state or {}).get('step', 0))
+            if self.config.rank == 0:
+                logger.info(
+                    f"DeepSpeed state loaded from {load_path}, resuming at step {self.step}"
+                )
+            return
+
         training_state_path = checkpoint_dir / "training_state.pt"
 
         if not training_state_path.exists():
@@ -401,10 +488,7 @@ class Trainer:
         if self.config.rank == 0:
             logger.info(f"Loading training state from {training_state_path}")
 
-        # All ranks load the training state directly
         training_state = torch.load(training_state_path, map_location='cpu', weights_only=False)
-
-        # All ranks load optimizer state (required for FSDP)
         set_optimizer_state_dict(
             self.transformer, self.optimizer,
             optim_state_dict=training_state['optimizer_state_dict'],
@@ -415,7 +499,6 @@ class Trainer:
         if self.config.rank == 0:
             logger.info(f"Training state loaded, resuming from step {self.step}")
 
-        # Synchronize all ranks
         if dist.is_initialized():
             dist.barrier()
 
@@ -496,9 +579,6 @@ class Trainer:
                         logger.info(f"Starting save model at step {self.step}")
                     self.save_checkpoint()
 
-            if dist.is_initialized():
-                dist.barrier()
-
         progress_bar.close()
         logger.info("Training completed!")
 
@@ -516,13 +596,46 @@ def run(args):
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size
+    config.distributed_backend = validate_distributed_backend(
+        args.distributed_backend
+    )
+    config.deepspeed_config_file = args.deepspeed_config
+    config.resume_from = args.resume_from
+    config.num_init_worker = (
+        args.num_init_workers
+        if args.num_init_workers is not None
+        else int(getattr(config, 'num_init_worker', 8))
+    )
+    config.gradient_clipping = float(
+        getattr(config, 'gradient_clipping', 2.0)
+    )
 
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.dataset_path is not None:
+        config.dataset_path = args.dataset_path
+        config.empty_emb_path = os.path.join(args.dataset_path, 'empty_emb.pt')
+    if args.empty_emb_path is not None:
+        config.empty_emb_path = args.empty_emb_path
+    if args.model_path is not None:
+        config.wan22_pretrained_model_name_or_path = args.model_path
+    if args.num_workers is not None:
+        config.load_worker = args.num_workers
+    if args.gradient_accumulation_steps is not None:
+        config.gradient_accumulation_steps = args.gradient_accumulation_steps
+    if args.num_steps is not None:
+        config.num_steps = args.num_steps
+    if args.save_interval is not None:
+        config.save_interval = args.save_interval
+    if args.disable_wandb:
+        config.enable_wandb = False
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
-        logger.info(f"World size: {world_size}, Local rank: {local_rank}")
+        logger.info(
+            f"Backend: {config.distributed_backend}, world size: {world_size}, "
+            f"local rank: {local_rank}"
+        )
 
     trainer = Trainer(config)
     trainer.train()
@@ -543,6 +656,26 @@ def main():
         default=None,
         help="Root directory for saving checkpoints",
     )
+    parser.add_argument(
+        "--distributed-backend",
+        choices=sorted(('fsdp', 'deepspeed')),
+        default='fsdp',
+    )
+    parser.add_argument(
+        "--deepspeed-config",
+        default="config/deepspeed/zero2.json",
+    )
+    parser.add_argument("--resume-from", default=None)
+    parser.add_argument("--dataset-path", default=None)
+    parser.add_argument("--empty-emb-path", default=None)
+    parser.add_argument("--model-path", default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--num-init-workers", type=int, default=None)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
+    parser.add_argument("--num-steps", type=int, default=None)
+    parser.add_argument("--save-interval", type=int, default=None)
+    parser.add_argument("--disable-wandb", action="store_true")
+    parser.add_argument("--local_rank", type=int, default=-1, help=argparse.SUPPRESS)
 
     args = parser.parse_args()
     run(args)

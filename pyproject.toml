@@ -34,6 +34,9 @@ dev = [
     "mypy",
     "huggingface-hub[cli]"
 ]
+deepspeed = [
+    "deepspeed>=0.16.9"
+]
 
 [project.urls]
 homepage = "https://github.com/Robbyant"

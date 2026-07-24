@@ -376,6 +376,61 @@ NGPU=8 CONFIG_NAME='libero_train' bash script/run_va_posttrain.sh
 
 For better training performance, use a larger global batch size (e.g., 32, 64). If you have limited GPU resources, you can increase `gradient_accumulation_steps` to achieve a larger effective batch size.
 
+### Multi-Node Training with DeepSpeed
+
+LingBot-VA can use DeepSpeed ZeRO-2 as an alternative to the default FSDP
+backend. This path uses data parallelism only; sequence parallelism is not
+required.
+
+Install the optional dependency:
+
+```bash
+pip install -e '.[deepspeed]'
+```
+
+Create a hostfile with one private training-network address per node:
+
+```text
+10.0.8.101 slots=8
+10.0.8.102 slots=8
+```
+
+The launch node must have passwordless SSH access to every host, including
+itself. The default launcher uses SSH to start one `torchrun` agent per node and
+does not require `pdsh`. Run the read-only preflight first:
+
+```bash
+HOSTFILE=/path/to/hostfile \
+PRECHECK_ONLY=1 \
+bash script/run_va_multinode.sh
+```
+
+Set `MULTINODE_LAUNCHER=pdsh` to use DeepSpeed's hostfile launcher instead; that
+mode requires `pdsh` on the launch node.
+
+Then launch from the first host only:
+
+```bash
+HOSTFILE=/path/to/hostfile \
+PRECHECK_ONLY=0 \
+CONFIG_NAME=robotwin_train \
+DATASET_PATH=/path/to/dataset \
+MODEL_PATH=/path/to/lingbot-va-base \
+SAVE_ROOT=/path/to/output \
+bash script/run_va_multinode.sh
+```
+
+Set `DISABLE_WANDB=1` when W&B is not configured. To resume, set
+`RESUME_FROM=/path/to/checkpoints/checkpoint_step_N`; all ranks restore the
+DeepSpeed optimizer and scheduler shards collectively.
+
+Before using a new environment for training, verify the DeepSpeed engine on two
+GPUs without loading LingBot-VA weights:
+
+```bash
+PYTHONPATH=. deepspeed --num_gpus 2 tests/deepspeed_engine_smoke.py
+```
+
 
 ---
 
