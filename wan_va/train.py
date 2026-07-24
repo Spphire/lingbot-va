@@ -48,6 +48,7 @@ from utils import (
 )
 
 from dataset import MultiLatentLeRobotDataset
+from wan_va.dataset.empty_embedding import generate_empty_embedding
 import gc
 
 
@@ -629,6 +630,33 @@ def run(args):
         config.save_interval = args.save_interval
     if args.disable_wandb:
         config.enable_wandb = False
+
+    if float(getattr(config, 'cfg_prob', 0.0)) > 0:
+        configured_empty_emb = Path(config.empty_emb_path)
+        if configured_empty_emb.is_file():
+            empty_emb_path = configured_empty_emb
+        elif args.empty_emb_path is not None:
+            empty_emb_path = configured_empty_emb
+        else:
+            empty_emb_path = Path(config.save_root) / "cache" / "empty_emb.pt"
+        config.empty_emb_path = str(empty_emb_path)
+
+        if rank == 0 and not empty_emb_path.is_file():
+            logger.info(
+                "Generating empty prompt embedding at %s",
+                empty_emb_path,
+            )
+            generate_empty_embedding(
+                config.wan22_pretrained_model_name_or_path,
+                empty_emb_path,
+                device=torch.device(f"cuda:{local_rank}"),
+            )
+        if world_size > 1:
+            dist.barrier(device_ids=[local_rank])
+        if not empty_emb_path.is_file():
+            raise FileNotFoundError(
+                f"Empty prompt embedding was not created: {empty_emb_path}"
+            )
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")

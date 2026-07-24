@@ -37,6 +37,12 @@ dev = [
 deepspeed = [
     "deepspeed>=0.16.9"
 ]
+posttrain = [
+    "datasets>=2.19.0,<=3.6.0",
+    "lerobot==0.3.3",
+    "scipy",
+    "wandb",
+]
 
 [project.urls]
 homepage = "https://github.com/Robbyant"

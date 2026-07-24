@@ -242,8 +242,12 @@ We support post-training (fine-tuning) LingBot-VA on custom robotic manipulation
 On top of the base installation, post-training requires:
 
 ```bash
-pip install lerobot==0.3.3 scipy wandb --no-deps
+pip install -e '.[posttrain]'
 ```
+
+The loader includes a compatibility shim for official parquet files written
+with the `datasets>=4` `List` schema, so the `datasets<=3.6` version required by
+LeRobot 0.3.3 can read them without rewriting the dataset.
 
 ### Data Preparation
 
@@ -252,6 +256,22 @@ Download the post-training dataset from HuggingFace:
 ```bash
 huggingface-cli download --repo-type dataset robbyant/robotwin-clean-and-aug-lerobot --local-dir /path/to/your/dataset
 ```
+
+In mainland China, the same download can use the Hugging Face mirror:
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com \
+huggingface-cli download --repo-type dataset \
+  robbyant/robotwin-clean-and-aug-lerobot \
+  --local-dir /path/to/your/dataset
+```
+
+Some official dataset snapshots do not include `empty_emb.pt`. When
+classifier-free dropout is enabled and the configured file is missing, rank 0
+now generates the empty-prompt embedding from the base model's tokenizer and
+text encoder, then caches it at `<save-root>/cache/empty_emb.pt`. Pass
+`--empty-emb-path` (or `EMPTY_EMB_PATH` in the multi-node launcher) to reuse a
+specific existing file.
 
 ### Custom Dataset Preparation
 
@@ -385,7 +405,7 @@ required.
 Install the optional dependency:
 
 ```bash
-pip install -e '.[deepspeed]'
+pip install -e '.[posttrain,deepspeed]'
 ```
 
 Create a hostfile with one private training-network address per node:
@@ -401,6 +421,7 @@ does not require `pdsh`. Run the read-only preflight first:
 
 ```bash
 HOSTFILE=/path/to/hostfile \
+PYTHON_BIN=/path/to/venv/bin/python \
 PRECHECK_ONLY=1 \
 bash script/run_va_multinode.sh
 ```
@@ -412,6 +433,7 @@ Then launch from the first host only:
 
 ```bash
 HOSTFILE=/path/to/hostfile \
+PYTHON_BIN=/path/to/venv/bin/python \
 PRECHECK_ONLY=0 \
 CONFIG_NAME=robotwin_train \
 DATASET_PATH=/path/to/dataset \

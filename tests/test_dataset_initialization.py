@@ -1,6 +1,17 @@
 from types import SimpleNamespace
 
+from datasets.features import features as feature_module
+
 from wan_va.dataset import lerobot_latent_dataset as dataset_module
+
+
+def test_registers_list_schema_compatibility(monkeypatch):
+    feature_types = {}
+    monkeypatch.setattr(feature_module, "_FEATURE_TYPES", feature_types)
+
+    dataset_module.ensure_hf_datasets_list_compat()
+
+    assert feature_types["List"] is feature_module.Sequence
 
 
 def test_single_dataset_is_constructed_without_worker_pool(monkeypatch):

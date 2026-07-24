@@ -10,6 +10,7 @@ PORT=${PORT:-"1106"}
 LOG_RANK=${LOG_RANK:-"0"}
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
 CONFIG_NAME=${CONFIG_NAME:-"robotwin_train"} # robotwin_train, libero_train
+PYTHON_BIN=${PYTHON_BIN:-"python"}
 
 overrides=""
 if [ $# -ne 0 ]; then
@@ -31,7 +32,7 @@ config_name=${CONFIG_NAME}
 ## cmd setting
 export TOKENIZERS_PARALLELISM=false
 PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" TORCHFT_LIGHTHOUSE=${torchft_lighthouse} \
-python -m torch.distributed.run \
+"${PYTHON_BIN}" -m torch.distributed.run \
     --nproc_per_node=${num_gpu} \
     --local-ranks-filter=${log_rank} \
     --master_port ${master_port} \

@@ -15,6 +15,15 @@ from torch.utils.data import DataLoader
 from scipy.spatial.transform import Rotation as R
 from lerobot.constants import HF_LEROBOT_HOME
 
+
+def ensure_hf_datasets_list_compat():
+    """Teach datasets<=3.6 to read parquet metadata written by datasets 4."""
+    from datasets.features import features as feature_module
+
+    if "List" not in feature_module._FEATURE_TYPES:
+        feature_module._FEATURE_TYPES["List"] = feature_module.Sequence
+
+
 def recursive_find_file(directory, filename='info.json'):
     result = []
     try:
@@ -114,6 +123,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         repo_id,
         config=None,
     ):
+        ensure_hf_datasets_list_compat()
         self.repo_id = repo_id
         self.root = HF_LEROBOT_HOME / repo_id
         self.image_transforms = None
@@ -144,10 +154,15 @@ class LatentLeRobotDataset(LeRobotDataset):
             self.hf_dataset = self.load_hf_dataset()
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
         
-        self.latent_path = Path(repo_id) / 'latents'
-        self.empty_emb = torch.load(config.empty_emb_path, weights_only=False)
         self.config = config
         self.cfg_prob = config.cfg_prob
+        self.latent_path = Path(repo_id) / 'latents'
+        self.empty_emb = None
+        if self.cfg_prob > 0:
+            self.empty_emb = torch.load(
+                config.empty_emb_path,
+                weights_only=False,
+            )
         self.used_video_keys = config.obs_cam_keys
         self.q01 = np.array(config.norm_stat['q01'], dtype='float')[None]
         self.q99 = np.array(config.norm_stat['q99'], dtype='float')[None]
@@ -247,7 +262,7 @@ class LatentLeRobotDataset(LeRobotDataset):
             cat_latent = torch.cat(latent_lst, dim=2)
 
         text_emb = data_dict[f"{self.used_video_keys[0]}.text_emb"]
-        if torch.rand(1).item() < self.cfg_prob:
+        if self.empty_emb is not None and torch.rand(1).item() < self.cfg_prob:
             text_emb = self.empty_emb
 
         out_dict = dict(

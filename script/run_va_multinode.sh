@@ -14,6 +14,7 @@ PRECHECK_ONLY="${PRECHECK_ONLY:-1}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 NUM_INIT_WORKERS="${NUM_INIT_WORKERS:-4}"
 MULTINODE_LAUNCHER="${MULTINODE_LAUNCHER:-ssh}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
 if [[ ! -f "${HOSTFILE}" ]]; then
   echo "Hostfile not found: ${HOSTFILE}" >&2
@@ -50,6 +51,7 @@ export TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-1}"
 export TORCH_DISTRIBUTED_TIMEOUT="${TORCH_DISTRIBUTED_TIMEOUT:-1800}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+printf -v PYTHON_Q '%q' "${PYTHON_BIN}"
 
 echo "Checking ${NNODES} hosts from ${HOSTFILE}"
 for host in "${ACTIVE_HOSTS[@]}"; do
@@ -58,7 +60,7 @@ for host in "${ACTIVE_HOSTS[@]}"; do
     -o StrictHostKeyChecking=accept-new \
     -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}" \
     "${SSH_USER}@${host}" \
-    "cd '${ROOT_DIR}' && command -v deepspeed >/dev/null && test \"\$(python -c 'import torch; print(torch.cuda.device_count())')\" -ge '${GPUS_PER_NODE}'"
+    "cd '${ROOT_DIR}' && ${PYTHON_Q} -c 'import deepspeed' && test \"\$(${PYTHON_Q} -c 'import torch; print(torch.cuda.device_count())')\" -ge '${GPUS_PER_NODE}'"
   echo "  ${host}: ready"
 done
 
@@ -82,6 +84,9 @@ if [[ -n "${DATASET_PATH:-}" ]]; then
 fi
 if [[ -n "${MODEL_PATH:-}" ]]; then
   ARGS+=(--model-path "${MODEL_PATH}")
+fi
+if [[ -n "${EMPTY_EMB_PATH:-}" ]]; then
+  ARGS+=(--empty-emb-path "${EMPTY_EMB_PATH}")
 fi
 if [[ -n "${RESUME_FROM:-}" ]]; then
   ARGS+=(--resume-from "${RESUME_FROM}")
@@ -128,7 +133,7 @@ TORCH_NCCL_BLOCKING_WAIT=1 \
 TORCH_DISTRIBUTED_TIMEOUT=${DIST_TIMEOUT_Q} \
 TOKENIZERS_PARALLELISM=false \
 PYTORCH_CUDA_ALLOC_CONF=${ALLOC_CONF_Q} \
-python -m torch.distributed.run \
+${PYTHON_Q} -m torch.distributed.run \
 --nnodes=${NNODES} \
 --nproc-per-node=${GPUS_PER_NODE} \
 --node-rank=${node_rank} \
