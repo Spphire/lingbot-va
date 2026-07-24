@@ -5,9 +5,9 @@ from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stat
 import numpy as np
 from pathlib import Path
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 import os
 from tqdm import tqdm
-from multiprocessing import Pool
 from functools import partial
 import torch
 from einops import rearrange
@@ -40,17 +40,20 @@ def construct_lerobot(
 def construct_lerobot_multi_processor(config, 
                                       num_init_worker=8,
                                       ):
-    datasets_out_lst = []
     construct_func = partial(
         construct_lerobot,
         config=config,
     )
     repo_list = recursive_find_file(config.dataset_path, 'info.json')
     repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
-    with Pool(num_init_worker) as pool:
-        datasets_out_lst = pool.map(construct_func, repo_list)
-                
-    return datasets_out_lst
+    if len(repo_list) <= 1 or num_init_worker <= 1:
+        return [construct_func(repo_id) for repo_id in repo_list]
+
+    # Dataset setup happens after CUDA and the process group are initialized.
+    # Threads avoid forking the fully loaded model into every init worker.
+    max_workers = min(num_init_worker, len(repo_list))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        return list(executor.map(construct_func, repo_list))
 
 def get_relative_pose(pose):
     if torch.is_tensor(pose):
