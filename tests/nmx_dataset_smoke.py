@@ -19,9 +19,14 @@ def main():
     )
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--all-recorded", action="store_true")
+    parser.add_argument(
+        "--config-name",
+        choices=("nmx_chip_train", "nmx_chip_train_per_view_pad"),
+        default="nmx_chip_train",
+    )
     args = parser.parse_args()
 
-    config = deepcopy(VA_CONFIGS["nmx_chip_train"])
+    config = deepcopy(VA_CONFIGS[args.config_name])
     if not args.all_recorded:
         config.dataset_path = args.dataset_root
     config.cfg_prob = 0.0
@@ -40,10 +45,18 @@ def main():
         assert not masks[:, :, 0].any()
         assert torch.isfinite(actions).all()
 
+    _, _, latent_height, latent_width = sample["latents"].shape
+    tokens_per_frame = (
+        latent_height // config.patch_size[1]
+    ) * (latent_width // config.patch_size[2])
+
     print(
         {
+            "config_name": args.config_name,
+            "visual_contract": config.visual_contract,
             "dataset_samples": len(dataset),
             "latents": tuple(sample["latents"].shape),
+            "tokens_per_frame": tokens_per_frame,
             "raw_actions": tuple(sample["raw_actions"].shape),
             "actions": tuple(sample["actions"].shape),
             "valid_action_values": int(sample["actions_mask"].sum()),

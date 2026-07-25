@@ -1,6 +1,7 @@
 """Training config for the recorded NMX chip dataset group."""
 
 import os
+from copy import deepcopy
 
 from easydict import EasyDict
 
@@ -50,8 +51,11 @@ va_nmx_chip_train_cfg.obs_cam_keys = [
     "observation.images.wrist_image_2",
 ]
 va_nmx_chip_train_cfg.env_type = "none"
-va_nmx_chip_train_cfg.height = 256
-va_nmx_chip_train_cfg.width = 256
+va_nmx_chip_train_cfg.height = 320
+va_nmx_chip_train_cfg.width = 240
+va_nmx_chip_train_cfg.visual_contract = "upstream_single_canvas_v1"
+va_nmx_chip_train_cfg.expected_latent_view_shapes = [(20, 15), (20, 15)]
+va_nmx_chip_train_cfg.expected_latent_channels = 48
 va_nmx_chip_train_cfg.action_dim = 30
 va_nmx_chip_train_cfg.action_per_frame = 12
 va_nmx_chip_train_cfg.actions_per_frame = 1
@@ -110,3 +114,14 @@ va_nmx_chip_train_cfg.batch_size = 1
 va_nmx_chip_train_cfg.gradient_accumulation_steps = 4
 va_nmx_chip_train_cfg.gradient_clipping = 2.0
 va_nmx_chip_train_cfg.num_steps = 10000
+
+
+# A visual-only A/B control. All data, action, optimizer, and model settings are
+# deep-copied from the upstream single-canvas baseline.
+va_nmx_chip_train_per_view_pad_cfg = deepcopy(va_nmx_chip_train_cfg)
+va_nmx_chip_train_per_view_pad_cfg.__name__ = (
+    "Config: NMX chip train, per-view padding"
+)
+va_nmx_chip_train_per_view_pad_cfg.visual_contract = (
+    "per_view_zero_pad_then_concat_v1"
+)

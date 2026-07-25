@@ -5,8 +5,12 @@ import numpy as np
 import torch
 
 from wan_va.chunking import build_chunk_ids, iter_chunk_slices
+from wan_va.configs import VA_CONFIGS
 from wan_va.dataset.lerobot_latent_dataset import (
+    PER_VIEW_ZERO_PAD_VISUAL_CONTRACT,
+    UPSTREAM_SINGLE_CANVAS_VISUAL_CONTRACT,
     LatentLeRobotDataset,
+    compose_nmx_latent_views,
     discover_dataset_roots,
 )
 from wan_va.dataset.nmx_action_adapter import (
@@ -99,6 +103,86 @@ def test_dataset_root_discovery_accepts_an_ordered_path_list(tmp_path):
     )
 
     assert roots == [str(direct_root), str(nested_root)]
+
+
+def _visual_config(visual_contract):
+    return _config(
+        patch_size=(1, 2, 2),
+        visual_contract=visual_contract,
+        expected_latent_view_shapes=[(20, 15), (20, 15)],
+        expected_latent_channels=1,
+    )
+
+
+def test_upstream_single_canvas_keeps_raw_20x30_geometry():
+    left = torch.ones(2, 20, 15, 1)
+    right = torch.full_like(left, 2)
+
+    composed = compose_nmx_latent_views(
+        [left, right],
+        _visual_config(UPSTREAM_SINGLE_CANVAS_VISUAL_CONTRACT),
+    )
+
+    assert composed.shape == (2, 20, 30, 1)
+    assert (composed.shape[1] // 2) * (composed.shape[2] // 2) == 150
+    # This cross-view pair is intentionally part of the upstream baseline.
+    torch.testing.assert_close(composed[0, 0, 14:16, 0], torch.tensor([1.0, 2.0]))
+
+
+def test_per_view_padding_builds_20x32_without_cross_view_patch():
+    left = torch.ones(2, 20, 15, 1)
+    right = torch.full_like(left, 2)
+
+    composed = compose_nmx_latent_views(
+        [left, right],
+        _visual_config(PER_VIEW_ZERO_PAD_VISUAL_CONTRACT),
+    )
+
+    assert composed.shape == (2, 20, 32, 1)
+    assert (composed.shape[1] // 2) * (composed.shape[2] // 2) == 160
+    torch.testing.assert_close(
+        composed[0, 0, 14:18, 0],
+        torch.tensor([1.0, 0.0, 2.0, 2.0]),
+    )
+    assert composed[0, 0, 31, 0] == 0
+
+
+def test_visual_contract_rejects_unexpected_view_geometry():
+    config = _visual_config(UPSTREAM_SINGLE_CANVAS_VISUAL_CONTRACT)
+
+    try:
+        compose_nmx_latent_views(
+            [torch.zeros(1, 20, 15, 1), torch.zeros(1, 20, 16, 1)],
+            config,
+        )
+    except ValueError as exc:
+        assert "expected [(20, 15), (20, 15)]" in str(exc)
+    else:
+        raise AssertionError("unexpected latent geometry must fail fast")
+
+
+def test_visual_ab_configs_differ_only_in_visual_contract():
+    baseline = VA_CONFIGS["nmx_chip_train"]
+    padded = VA_CONFIGS["nmx_chip_train_per_view_pad"]
+
+    assert baseline.visual_contract == UPSTREAM_SINGLE_CANVAS_VISUAL_CONTRACT
+    assert padded.visual_contract == PER_VIEW_ZERO_PAD_VISUAL_CONTRACT
+    baseline_values = dict(baseline)
+    padded_values = dict(padded)
+    for key in ("__name__", "visual_contract"):
+        baseline_values.pop(key, None)
+        padded_values.pop(key, None)
+    assert baseline_values == padded_values
+
+    for key in (
+        "dataset_path",
+        "expected_latent_view_shapes",
+        "relative_pose_groups",
+        "used_action_channel_ids",
+        "inverse_used_action_channel_ids",
+    ):
+        assert baseline[key] is not padded[key]
+    assert baseline.relative_pose_groups[0] is not padded.relative_pose_groups[0]
 
 
 def test_temporal_clip_keeps_latents_and_frame_ids_aligned(monkeypatch):

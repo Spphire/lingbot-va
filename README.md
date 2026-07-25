@@ -427,13 +427,35 @@ For multi-node training, use `CONFIG_NAME=nmx_chip_train` with
 recorded 15-root list. Override that list with colon-separated roots in
 `NMX_CHIP_DATASET_PATHS`.
 
-This compatibility path intentionally uses the two wrist views, concatenated as
-the upstream model's single canvas, and the cached PTH text embeddings. The
-reference run instead kept independent multiview slots before dropping the head
-view and head action with probability 1.0. It also used nmx_vla's MoT model,
-online T5, and sequence parallel implementation; those architecture features
-are not required to train the original LingBot-VA model on the same action/data
-contract.
+`nmx_chip_train` is the original LingBot-VA visual baseline. It keeps the two
+cached `20x15` wrist latents unchanged and concatenates them into the upstream
+single canvas (`20x30`, 150 patch tokens per latent frame). The patch crossing
+the camera boundary is intentional in this control: changing it would no longer
+test the upstream visual path.
+
+`nmx_chip_train_per_view_pad` is a visual-only A/B control. It right-pads each wrist
+latent from `20x15` to `20x16` with zeros before concatenating the `20x32`
+single canvas (160 patch tokens per latent frame). Both configs use the same
+dataset roots, cached PTH text embeddings, action adapter, shared transformer,
+optimizer, and training settings.
+
+Use matching NMX inference geometry for each checkpoint. The upstream baseline
+uses `height: 320`, `width: 240`, the two wrist camera keys, and
+`multi_view_shape: null`. The padded control requires a non-null
+`multi_view_shape` mapping with `[320, 240]` for each wrist. Mixing these
+settings changes the visual token contract.
+
+Inspect both real-data inputs before GPU training:
+
+```bash
+PYTHONPATH=. python tests/nmx_dataset_smoke.py --config-name nmx_chip_train --all-recorded
+PYTHONPATH=. python tests/nmx_dataset_smoke.py --config-name nmx_chip_train_per_view_pad --all-recorded
+PYTHONPATH=. python tests/nmx_visual_ab_smoke.py
+```
+
+The recorded nmx_vla run additionally used independent multiview slots, MoT,
+online T5, and sequence parallelism. Those changes are deliberately excluded
+from the upstream baseline so this A/B test isolates visual composition.
 
 ### Multi-Node Training with DeepSpeed
 

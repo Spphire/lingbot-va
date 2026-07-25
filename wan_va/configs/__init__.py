@@ -10,7 +10,10 @@ from .va_demo_i2va import va_demo_i2va_cfg
 from .va_libero_cfg import va_libero_cfg
 from .va_libero_train_cfg import va_libero_train_cfg
 from .va_libero_i2va import va_libero_i2va_cfg
-from .va_nmx_chip_train_cfg import va_nmx_chip_train_cfg
+from .va_nmx_chip_train_cfg import (
+    va_nmx_chip_train_cfg,
+    va_nmx_chip_train_per_view_pad_cfg,
+)
 
 VA_CONFIGS = {
     'robotwin': va_robotwin_cfg,
@@ -25,4 +28,5 @@ VA_CONFIGS = {
     'libero_train': va_libero_train_cfg,
     'libero_i2av': va_libero_i2va_cfg,
     'nmx_chip_train': va_nmx_chip_train_cfg,
+    'nmx_chip_train_per_view_pad': va_nmx_chip_train_per_view_pad_cfg,
 }

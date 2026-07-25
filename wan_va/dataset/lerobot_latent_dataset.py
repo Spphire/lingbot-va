@@ -10,6 +10,7 @@ import os
 from tqdm import tqdm
 from functools import partial
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 from torch.utils.data import DataLoader
 from scipy.spatial.transform import Rotation as R
@@ -23,6 +24,109 @@ from wan_va.dataset.nmx_action_adapter import (
     prepare_raw_action_tensor,
     uses_nmx_action_contract,
 )
+
+
+UPSTREAM_SINGLE_CANVAS_VISUAL_CONTRACT = "upstream_single_canvas_v1"
+PER_VIEW_ZERO_PAD_VISUAL_CONTRACT = "per_view_zero_pad_then_concat_v1"
+_NMX_VISUAL_CONTRACTS = {
+    UPSTREAM_SINGLE_CANVAS_VISUAL_CONTRACT,
+    PER_VIEW_ZERO_PAD_VISUAL_CONTRACT,
+}
+
+
+def _pad_latent_view_to_patch_size(latent, patch_size):
+    """Right/bottom-pad one FHWC view without changing its temporal contract."""
+    patch_f, patch_h, patch_w = (int(value) for value in patch_size)
+    if min(patch_f, patch_h, patch_w) <= 0:
+        raise ValueError(f"patch_size must be positive, got {tuple(patch_size)}")
+    if patch_f != 1:
+        raise ValueError(
+            "The visual-only padding control requires temporal patch size 1, "
+            f"got {patch_f}"
+        )
+
+    _, height, width, _ = latent.shape
+    pad_height = (-height) % patch_h
+    pad_width = (-width) % patch_w
+    if not (pad_height or pad_width):
+        return latent
+
+    latent = latent.permute(3, 0, 1, 2)
+    latent = F.pad(
+        latent,
+        (0, pad_width, 0, pad_height),
+        mode="constant",
+        value=0,
+    )
+    return latent.permute(1, 2, 3, 0).contiguous()
+
+
+def compose_nmx_latent_views(latent_views, config):
+    """Compose NMX wrist views while keeping the selected visual contract explicit."""
+    if not latent_views:
+        raise ValueError("NMX visual contract requires at least one latent view")
+    if any(latent.ndim != 4 for latent in latent_views):
+        shapes = [tuple(latent.shape) for latent in latent_views]
+        raise ValueError(f"NMX latent views must be FHWC tensors, got {shapes}")
+
+    visual_contract = getattr(
+        config,
+        "visual_contract",
+        UPSTREAM_SINGLE_CANVAS_VISUAL_CONTRACT,
+    )
+    if visual_contract not in _NMX_VISUAL_CONTRACTS:
+        raise ValueError(
+            f"Unsupported NMX visual_contract {visual_contract!r}; "
+            f"expected one of {sorted(_NMX_VISUAL_CONTRACTS)}"
+        )
+
+    actual_view_shapes = [
+        (int(latent.shape[1]), int(latent.shape[2])) for latent in latent_views
+    ]
+    expected_view_shapes = getattr(config, "expected_latent_view_shapes", None)
+    if expected_view_shapes is not None:
+        expected_view_shapes = [tuple(map(int, shape)) for shape in expected_view_shapes]
+        if actual_view_shapes != expected_view_shapes:
+            raise ValueError(
+                "NMX latent view geometry does not match the configured visual "
+                f"contract: expected {expected_view_shapes}, got {actual_view_shapes}"
+            )
+
+    frame_counts = {int(latent.shape[0]) for latent in latent_views}
+    channel_counts = {int(latent.shape[3]) for latent in latent_views}
+    if len(frame_counts) != 1 or len(channel_counts) != 1:
+        raise ValueError(
+            "NMX latent views must share frame and channel counts, got "
+            f"{[tuple(latent.shape) for latent in latent_views]}"
+        )
+    expected_channels = getattr(config, "expected_latent_channels", None)
+    if expected_channels is not None and channel_counts != {int(expected_channels)}:
+        raise ValueError(
+            f"NMX latent views must have {int(expected_channels)} channels, "
+            f"got {sorted(channel_counts)}"
+        )
+
+    patch_size = tuple(int(value) for value in config.patch_size)
+    if visual_contract == PER_VIEW_ZERO_PAD_VISUAL_CONTRACT:
+        latent_views = [
+            _pad_latent_view_to_patch_size(latent, patch_size)
+            for latent in latent_views
+        ]
+
+    try:
+        composed = torch.cat(latent_views, dim=2)
+    except RuntimeError as exc:
+        raise ValueError(
+            "NMX single-canvas views must have compatible frame and height dimensions"
+        ) from exc
+
+    composed_fhw = tuple(int(value) for value in composed.shape[:3])
+    if any(size % patch != 0 for size, patch in zip(composed_fhw, patch_size)):
+        raise ValueError(
+            f"Composed latent shape {composed_fhw} is not divisible by patch_size "
+            f"{patch_size} under visual_contract={visual_contract!r}"
+        )
+    return composed
 
 
 def ensure_hf_datasets_list_compat():
@@ -355,6 +459,8 @@ class LatentLeRobotDataset(LeRobotDataset):
         if self.config.env_type == 'robotwin_tshape':
             wrist_latent = torch.cat(latent_lst[1:], dim=2)
             cat_latent = torch.cat([wrist_latent, latent_lst[0]], dim=1)
+        elif self.nmx_action_contract:
+            cat_latent = compose_nmx_latent_views(latent_lst, self.config)
         else:
             cat_latent = torch.cat(latent_lst, dim=2)
 
