@@ -26,6 +26,8 @@ from torch.nn.attention.flex_attention import (
 )
 from functools import partial
 
+from wan_va.chunking import build_chunk_ids
+
 try:
     from flash_attn_interface import flash_attn_func
 except:
@@ -100,6 +102,7 @@ class FlexAttnFunc(nn.Module):
         window_size,
         patch_size,
         device,
+        chunk_grouping_start_from_one=False,
     ):
         torch._inductor.config.realize_opcount_threshold = 100
         B, _, L_F, L_H, L_W = latent_shape
@@ -112,7 +115,19 @@ class FlexAttnFunc(nn.Module):
 
         latent_frame_id = torch.arange(L_F)[None, :, None, None].expand(B, -1, L_H // patch_size[1], L_W // patch_size[2])[None].flatten()
         action_frame_id = torch.arange(A_F)[None, :, None, None].expand(B, -1, A_H, A_W)[None].flatten()
-        frame_ids = torch.cat([latent_frame_id // chunk_size * 2] * 2 + [action_frame_id // chunk_size * 2 + 1] * 2)
+        latent_chunk_id = build_chunk_ids(
+            latent_frame_id,
+            chunk_size,
+            grouping_start_from_one=chunk_grouping_start_from_one,
+        )
+        action_chunk_id = build_chunk_ids(
+            action_frame_id,
+            chunk_size,
+            grouping_start_from_one=chunk_grouping_start_from_one,
+        )
+        frame_ids = torch.cat(
+            [latent_chunk_id * 2] * 2 + [action_chunk_id * 2 + 1] * 2
+        )
 
         noise_ids = torch.cat(
             [
@@ -768,7 +783,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                input_dict["chunk_size"],
                                window_size=input_dict['window_size'],
                                patch_size=self.patch_size,
-                               device=hidden_states.device
+                               device=hidden_states.device,
+                               chunk_grouping_start_from_one=input_dict.get(
+                                   'chunk_grouping_start_from_one', False
+                               ),
                                )
 
         for block in self.blocks:

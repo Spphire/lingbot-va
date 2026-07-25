@@ -15,6 +15,15 @@ from torch.utils.data import DataLoader
 from scipy.spatial.transform import Rotation as R
 from lerobot.constants import HF_LEROBOT_HOME
 
+from wan_va.dataset.nmx_action_adapter import (
+    apply_episode_action_validity,
+    build_model_actions_from_raw,
+    infer_sampled_video_frames_per_latent,
+    load_action_norm_stats,
+    prepare_raw_action_tensor,
+    uses_nmx_action_contract,
+)
+
 
 def ensure_hf_datasets_list_compat():
     """Teach datasets<=3.6 to read parquet metadata written by datasets 4."""
@@ -37,6 +46,25 @@ def recursive_find_file(directory, filename='info.json'):
         print(f"Error: {e}")
     return result
 
+def discover_dataset_roots(dataset_path):
+    paths = (
+        list(dataset_path)
+        if isinstance(dataset_path, (list, tuple))
+        else [dataset_path]
+    )
+    roots = []
+    for configured_path in paths:
+        configured_path = os.fspath(configured_path)
+        if os.path.isfile(os.path.join(configured_path, 'meta', 'info.json')):
+            roots.append(configured_path)
+            continue
+        roots.extend(
+            value.split('/meta/info.json')[0]
+            for value in recursive_find_file(configured_path, 'info.json')
+        )
+    # Preserve the training-record order while avoiding duplicate roots.
+    return list(dict.fromkeys(roots))
+
 def construct_lerobot(
     repo_id,
     config,
@@ -53,8 +81,11 @@ def construct_lerobot_multi_processor(config,
         construct_lerobot,
         config=config,
     )
-    repo_list = recursive_find_file(config.dataset_path, 'info.json')
-    repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
+    if uses_nmx_action_contract(config):
+        repo_list = discover_dataset_roots(config.dataset_path)
+    else:
+        repo_list = recursive_find_file(config.dataset_path, 'info.json')
+        repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
     if len(repo_list) <= 1 or num_init_worker <= 1:
         return [construct_func(repo_id) for repo_id in repo_list]
 
@@ -154,6 +185,7 @@ class LatentLeRobotDataset(LeRobotDataset):
             self.hf_dataset = self.load_hf_dataset()
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
         
+        self.nmx_action_contract = uses_nmx_action_contract(config)
         self.config = config
         self.cfg_prob = config.cfg_prob
         self.latent_path = Path(repo_id) / 'latents'
@@ -164,11 +196,26 @@ class LatentLeRobotDataset(LeRobotDataset):
                 weights_only=False,
             )
         self.used_video_keys = config.obs_cam_keys
-        self.q01 = np.array(config.norm_stat['q01'], dtype='float')[None]
-        self.q99 = np.array(config.norm_stat['q99'], dtype='float')[None]
+        if self.nmx_action_contract:
+            norm_stat = load_action_norm_stats(self.root, config)
+        else:
+            norm_stat = config.norm_stat
+        norm_dtype = 'float32' if self.nmx_action_contract else 'float'
+        self.q01 = np.array(norm_stat['q01'], dtype=norm_dtype)[None]
+        self.q99 = np.array(norm_stat['q99'], dtype=norm_dtype)[None]
+        columns = ['action']
+        self.state_column = None
+        if self.nmx_action_contract:
+            self.state_column = getattr(config, 'state_column', 'observation.state')
+            if self.state_column not in self.hf_dataset.column_names:
+                raise ValueError(
+                    f"{self.root}: NMX action contract requires parquet column "
+                    f"{self.state_column!r}"
+                )
+            columns.append(self.state_column)
         self._hf_torch_view = self.hf_dataset.with_format(
                 type='torch',
-                columns=['action'],
+                columns=columns,
                 output_all_columns=False
             )
         self.parse_meta()
@@ -184,6 +231,14 @@ class LatentLeRobotDataset(LeRobotDataset):
                     "episode_index": episode_index,
                     "tasks": tasks,
                 }
+                if self.nmx_action_contract:
+                    cur_meta["slam_validity_all"] = bool(
+                        value.get("slam_validity_all", True)
+                    )
+                    cur_meta["width_validity"] = bool(
+                        value.get("width_detection", True)
+                        and value.get("width_calibration", True)
+                    )
                 cur_meta.update(acfg)
 
                 check_statu = self._check_meta(
@@ -239,6 +294,48 @@ class LatentLeRobotDataset(LeRobotDataset):
         
         return self._flatten_latent_dict(out)
     
+    def _clip_temporal_latents(self, data_dict):
+        max_latent_frames = getattr(self.config, 'max_latent_frames', None)
+        if not self.nmx_action_contract or max_latent_frames is None:
+            return data_dict
+
+        reference_key = self.used_video_keys[0]
+        source_latent_frames = int(data_dict[f"{reference_key}.latent_num_frames"])
+        clip_frames = min(source_latent_frames, int(max_latent_frames))
+        if clip_frames == source_latent_frames:
+            return data_dict
+        clip_start = int(np.random.randint(0, source_latent_frames - clip_frames + 1))
+        clip_end = clip_start + clip_frames
+
+        for key in self.used_video_keys:
+            key_latent_frames = int(data_dict[f"{key}.latent_num_frames"])
+            if key_latent_frames != source_latent_frames:
+                raise ValueError(
+                    f"Latent frame mismatch across views: {key} has {key_latent_frames}, "
+                    f"expected {source_latent_frames}"
+                )
+            latent_height = int(data_dict[f"{key}.latent_height"])
+            latent_width = int(data_dict[f"{key}.latent_width"])
+            tokens_per_frame = latent_height * latent_width
+            data_dict[f"{key}.latent"] = data_dict[f"{key}.latent"][
+                clip_start * tokens_per_frame : clip_end * tokens_per_frame
+            ].contiguous()
+            data_dict[f"{key}.latent_num_frames"] = clip_frames
+
+            frame_ids = list(data_dict[f"{key}.frame_ids"])
+            source_video_frames = int(
+                data_dict.get(f"{key}.video_num_frames", len(frame_ids))
+            )
+            sampled_per_latent = infer_sampled_video_frames_per_latent(
+                source_video_frames, source_latent_frames
+            )
+            frame_start = min(clip_start * sampled_per_latent, len(frame_ids) - 1)
+            frame_count = (clip_frames - 1) * sampled_per_latent + 1
+            clipped_ids = frame_ids[frame_start : frame_start + frame_count]
+            data_dict[f"{key}.frame_ids"] = clipped_ids
+            data_dict[f"{key}.video_num_frames"] = len(clipped_ids)
+        return data_dict
+
         
     def _cat_video_latents(self,
                            data_dict
@@ -271,7 +368,47 @@ class LatentLeRobotDataset(LeRobotDataset):
         )
         return out_dict
     
-    def _action_post_process(self, local_start_frame, local_end_frame, latent_frame_ids, action):
+    def _action_post_process(
+        self,
+        local_start_frame,
+        local_end_frame,
+        latent_frame_ids,
+        action,
+        *,
+        latent_frame_num=None,
+        video_num_frames=None,
+        state=None,
+    ):
+        if self.nmx_action_contract:
+            if state is None:
+                raise ValueError("NMX action contract requires an absolute state trajectory")
+            raw_action, step_mask = prepare_raw_action_tensor(
+                local_start_frame,
+                latent_frame_ids,
+                latent_frame_num,
+                video_num_frames,
+                action,
+                self.config,
+            )
+            raw_state, _ = prepare_raw_action_tensor(
+                local_start_frame,
+                latent_frame_ids,
+                latent_frame_num,
+                video_num_frames,
+                state,
+                self.config,
+            )
+            actions, actions_mask = build_model_actions_from_raw(
+                raw_action,
+                raw_state,
+                step_mask,
+                self.config,
+                q01=self.q01.squeeze(0),
+                q99=self.q99.squeeze(0),
+                chunk_size_frames=int(self.config.action_chunk_size_max),
+            )
+            return actions, actions_mask, raw_action, step_mask, raw_state
+
         act_shift = int(latent_frame_ids[0] - local_start_frame)
         frame_stride = latent_frame_ids[1] - latent_frame_ids[0]
         action = action[act_shift:]
@@ -312,6 +449,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         local_end_frame = end_frame
 
         ori_data_dict = self._get_range_latent_data(start_frame, end_frame, episode_index)
+        ori_data_dict = self._clip_temporal_latents(ori_data_dict)
 
         latent_frame_ids = ori_data_dict[f"{self.used_video_keys[0]}.frame_ids"]
         start_frame = self._get_global_idx(episode_index, start_frame)
@@ -321,7 +459,42 @@ class LatentLeRobotDataset(LeRobotDataset):
         ori_data_dict.update(hf_data_frames)
         out_dict = self._cat_video_latents(ori_data_dict)
 
-        out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(local_start_frame, local_end_frame, latent_frame_ids, ori_data_dict['action'])
+        if self.nmx_action_contract:
+            reference_key = self.used_video_keys[0]
+            (
+                out_dict['actions'],
+                out_dict['actions_mask'],
+                out_dict['raw_actions'],
+                out_dict['raw_actions_step_mask'],
+                out_dict['raw_states'],
+            ) = self._action_post_process(
+                local_start_frame,
+                local_end_frame,
+                latent_frame_ids,
+                ori_data_dict['action'],
+                latent_frame_num=int(
+                    ori_data_dict[f"{reference_key}.latent_num_frames"]
+                ),
+                video_num_frames=int(
+                    ori_data_dict[f"{reference_key}.video_num_frames"]
+                ),
+                state=ori_data_dict[self.state_column],
+            )
+            out_dict['action_q01'] = torch.from_numpy(self.q01.squeeze(0).copy())
+            out_dict['action_q99'] = torch.from_numpy(self.q99.squeeze(0).copy())
+            apply_episode_action_validity(
+                out_dict,
+                self.config,
+                action_valid=bool(cur_meta.get('slam_validity_all', True)),
+                width_valid=bool(cur_meta.get('width_validity', True)),
+            )
+        else:
+            out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(
+                local_start_frame,
+                local_end_frame,
+                latent_frame_ids,
+                ori_data_dict['action'],
+            )
 
         out_dict['latents'] = out_dict['latents'].permute(3, 0, 1, 2)
         return out_dict

@@ -1,0 +1,112 @@
+"""Training config for the recorded NMX chip dataset group."""
+
+import os
+
+from easydict import EasyDict
+
+from .shared_config import va_shared_cfg
+
+
+_RECORDED_DATASET_PATHS = [
+    "/mnt/workspace/shenyibo/datasets/chip_0709_1952episodes",
+    "/mnt/workspace/shenyibo/datasets/chip_0711_199episodes",
+    "/mnt/workspace/shenyibo/datasets/chip_paralle_0710_742episodes",
+    "/mnt/workspace/shenyibo/datasets/chip_paralle_0712_1048episodes",
+    "/mnt/workspace/shenyibo/datasets/chip_recovery_0709_449episodes",
+    "/mnt/workspace/shenyibo/datasets/chip_recovery_0711_121episodes",
+    "/mnt/workspace/shenyibo/datasets/chip_recovery_clamp_0712_367episodes",
+    "/mnt/workspace/shenyibo/datasets/chip_recovery_clamp_561episodes",
+    "/mnt/workspace/shenyibo/datasets/chip_recovery_place_700episodes",
+    "/mnt/workspace/shenyibo/datasets/chip_recovery_slide_0712_389episodes",
+    "/mnt/workspace/shenyibo/datasets/chip_recovery_slide_672episodes",
+    "/mnt/workspace/shenyibo/datasets/chip_reset_0709_454episodes",
+    "/mnt/workspace/shenyibo/rollout_data/lerobot/0713_rollout_pi05_umi_dual_arm_quat_mix0712_ABC_balanced_l0r4_plus_chip_l4r2e0",
+    "/mnt/workspace/shenyibo/rollout_data/lerobot/0715_merged_pi05_umi_dual_arm_chip_0712",
+    "/mnt/workspace/shenyibo/datasets/waic_chip_0715",
+]
+
+
+va_nmx_chip_train_cfg = EasyDict(__name__="Config: NMX chip train")
+va_nmx_chip_train_cfg.update(va_shared_cfg)
+
+configured_paths = os.getenv("NMX_CHIP_DATASET_PATHS")
+va_nmx_chip_train_cfg.dataset_path = (
+    configured_paths.split(os.pathsep) if configured_paths else _RECORDED_DATASET_PATHS
+)
+va_nmx_chip_train_cfg.empty_emb_path = os.getenv(
+    "NMX_CHIP_EMPTY_EMB_PATH",
+    "/mnt/workspace/shenyibo/datasets/chip_0711_199episodes/empty_emb.pt",
+)
+va_nmx_chip_train_cfg.wan22_pretrained_model_name_or_path = os.getenv(
+    "LINGBOT_VA_MODEL_PATH",
+    "/path/to/pretrained/model",
+)
+
+# The recorded run dropped the head view and head action with probability 1.
+# This config keeps that supervision choice while preserving the upstream model's
+# single-canvas input instead of porting nmx_vla's independent multiview slots.
+va_nmx_chip_train_cfg.obs_cam_keys = [
+    "observation.images.wrist_image_1",
+    "observation.images.wrist_image_2",
+]
+va_nmx_chip_train_cfg.env_type = "none"
+va_nmx_chip_train_cfg.height = 256
+va_nmx_chip_train_cfg.width = 256
+va_nmx_chip_train_cfg.action_dim = 30
+va_nmx_chip_train_cfg.action_per_frame = 12
+va_nmx_chip_train_cfg.actions_per_frame = 1
+
+va_nmx_chip_train_cfg.action_contract = "nmx_chunk_relative_v10"
+va_nmx_chip_train_cfg.action_chunk_size_min = 1
+va_nmx_chip_train_cfg.action_chunk_size_max = 4
+va_nmx_chip_train_cfg.window_size_min = 3
+va_nmx_chip_train_cfg.window_size_max = 3
+va_nmx_chip_train_cfg.chunk_grouping_start_from_one = True
+va_nmx_chip_train_cfg.max_latent_frames = 116
+va_nmx_chip_train_cfg.relative_pose_frame = "local_frame"
+va_nmx_chip_train_cfg.quaternion_order = "wxyz"
+va_nmx_chip_train_cfg.relative_pose_groups = [
+    {"pose_slice": [0, 7], "gripper_slice": [7, 8]},
+    {"pose_slice": [8, 15], "gripper_slice": [15, 16]},
+]
+va_nmx_chip_train_cfg.used_action_channel_ids = (
+    list(range(0, 7)) + [28] + list(range(7, 14)) + [29]
+)
+va_nmx_chip_train_cfg.gripper_canonical_dims = [28, 29]
+va_nmx_chip_train_cfg.gripper_raw_dims = [7, 15]
+inverse_ids = [len(va_nmx_chip_train_cfg.used_action_channel_ids)] * 30
+for source_index, canonical_index in enumerate(
+    va_nmx_chip_train_cfg.used_action_channel_ids
+):
+    inverse_ids[canonical_index] = source_index
+va_nmx_chip_train_cfg.inverse_used_action_channel_ids = inverse_ids
+va_nmx_chip_train_cfg.action_norm_stats_filename = "lingbot_action_norm_stats.json"
+va_nmx_chip_train_cfg.action_norm_stats_version = (
+    "chunk_relative_v10_velocity_symmetric_scale"
+)
+
+va_nmx_chip_train_cfg.attn_window = 3
+va_nmx_chip_train_cfg.frame_chunk_size = 4
+va_nmx_chip_train_cfg.guidance_scale = 5
+va_nmx_chip_train_cfg.action_guidance_scale = 1
+va_nmx_chip_train_cfg.num_inference_steps = 25
+va_nmx_chip_train_cfg.video_exec_step = -1
+va_nmx_chip_train_cfg.action_num_inference_steps = 50
+va_nmx_chip_train_cfg.snr_shift = 5.0
+va_nmx_chip_train_cfg.action_snr_shift = 1.0
+
+va_nmx_chip_train_cfg.enable_wandb = False
+va_nmx_chip_train_cfg.load_worker = 4
+va_nmx_chip_train_cfg.num_init_worker = 8
+va_nmx_chip_train_cfg.save_interval = 1000
+va_nmx_chip_train_cfg.gc_interval = 50
+va_nmx_chip_train_cfg.cfg_prob = 0.1
+va_nmx_chip_train_cfg.learning_rate = 1e-5
+va_nmx_chip_train_cfg.beta1 = 0.9
+va_nmx_chip_train_cfg.beta2 = 0.95
+va_nmx_chip_train_cfg.weight_decay = 0.1
+va_nmx_chip_train_cfg.warmup_steps = 10
+va_nmx_chip_train_cfg.batch_size = 1
+va_nmx_chip_train_cfg.gradient_accumulation_steps = 4
+va_nmx_chip_train_cfg.gradient_clipping = 2.0
+va_nmx_chip_train_cfg.num_steps = 10000

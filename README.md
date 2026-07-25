@@ -396,6 +396,45 @@ NGPU=8 CONFIG_NAME='libero_train' bash script/run_va_posttrain.sh
 
 For better training performance, use a larger global batch size (e.g., 32, 64). If you have limited GPU resources, you can increase `gradient_accumulation_steps` to achieve a larger effective batch size.
 
+#### NMX recorded LingBot-VA datasets
+
+The opt-in `nmx_chip_train` config reads the 15 recorded chip dataset roots used
+by the corresponding nmx_vla run. Each root must contain cached wrist-camera
+latents, `action` and `observation.state` trajectories in 23D absolute `wxyz`
+pose format, and `lingbot_action_norm_stats.json`.
+
+The adapter converts each sampled action chunk to state-anchored local relative
+poses, maps the two arms and grippers into the canonical 30D action space, and
+uses the same randomly sampled chunk size for action targets and causal
+attention. Existing RoboTwin and LIBERO configs keep their upstream behavior.
+
+Run a one-step single-node DeepSpeed smoke before a longer job:
+
+```bash
+NGPU=8 CONFIG_NAME=nmx_chip_train \
+PYTHON_BIN=/path/to/venv/bin/python \
+bash script/run_va_posttrain.sh \
+  --distributed-backend deepspeed \
+  --deepspeed-config config/deepspeed/zero2.json \
+  --model-path /path/to/lingbot-va-base \
+  --save-root /path/to/output \
+  --num-workers 0 --num-init-workers 1 \
+  --num-steps 1 --disable-wandb
+```
+
+For multi-node training, use `CONFIG_NAME=nmx_chip_train` with
+`script/run_va_multinode.sh` and leave `DATASET_PATH` unset to select the
+recorded 15-root list. Override that list with colon-separated roots in
+`NMX_CHIP_DATASET_PATHS`.
+
+This compatibility path intentionally uses the two wrist views, concatenated as
+the upstream model's single canvas, and the cached PTH text embeddings. The
+reference run instead kept independent multiview slots before dropping the head
+view and head action with probability 1.0. It also used nmx_vla's MoT model,
+online T5, and sequence parallel implementation; those architecture features
+are not required to train the original LingBot-VA model on the same action/data
+contract.
+
 ### Multi-Node Training with DeepSpeed
 
 LingBot-VA can use DeepSpeed ZeRO-2 as an alternative to the default FSDP

@@ -48,6 +48,10 @@ from utils import (
 )
 
 from dataset import MultiLatentLeRobotDataset
+from wan_va.dataset.nmx_action_adapter import (
+    rebuild_batch_actions,
+    uses_nmx_action_contract,
+)
 from wan_va.dataset.empty_embedding import generate_empty_embedding
 import gc
 
@@ -285,6 +289,27 @@ class Trainer:
     @torch.no_grad()
     def _prepare_input_dict(self, batch_dict):
         """Prepare input dict following infer code pattern from wan_va_server.py."""
+        nmx_action_contract = uses_nmx_action_contract(self.config)
+        if nmx_action_contract:
+            chunk_size = torch.randint(
+                int(getattr(self.config, 'action_chunk_size_min', 1)),
+                int(getattr(self.config, 'action_chunk_size_max', 4)) + 1,
+                (1,),
+            ).item()
+            window_size = torch.randint(
+                int(getattr(self.config, 'window_size_min', 4)),
+                int(getattr(self.config, 'window_size_max', 64)) + 1,
+                (1,),
+            ).item()
+            batch_actions, batch_action_masks = rebuild_batch_actions(
+                batch_dict,
+                self.config,
+                chunk_size,
+            )
+        else:
+            batch_actions = batch_dict['actions']
+            batch_action_masks = batch_dict['actions_mask']
+
         # Generate grid_id following infer code (no batch dimension yet)
         # For action mode: get_mesh_id(shape[-3], shape[-2], shape[-1], t=1, f_w=1, f_shift, action=True)
         latent_dict = self._add_noise(
@@ -295,21 +320,29 @@ class Trainer:
             noisy_cond_prob=0.5)
         
         action_dict = self._add_noise(
-            latent=batch_dict['actions'], 
+            latent=batch_actions,
             train_scheduler=self.train_scheduler_action, 
-            action_mask=batch_dict['actions_mask'], 
+            action_mask=batch_action_masks,
             action_mode=True,
             noisy_cond_prob=0.0)
 
         latent_dict['text_emb'] = batch_dict['text_emb']
         action_dict['text_emb'] = batch_dict['text_emb']
-        action_dict['actions_mask'] = batch_dict['actions_mask']
+        action_dict['actions_mask'] = batch_action_masks
+
+        if not nmx_action_contract:
+            # Keep the upstream RNG order unchanged for existing training configs.
+            chunk_size = torch.randint(1, 5, (1,)).item()
+            window_size = torch.randint(4, 65, (1,)).item()
 
         input_dict = {
             'latent_dict': latent_dict,
             'action_dict': action_dict,
-            'chunk_size': torch.randint(1, 5, (1,)).item(),
-            'window_size': torch.randint(4, 65, (1,)).item(),
+            'chunk_size': chunk_size,
+            'window_size': window_size,
+            'chunk_grouping_start_from_one': bool(
+                getattr(self.config, 'chunk_grouping_start_from_one', False)
+            ),
         }
         return input_dict
 
