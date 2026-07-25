@@ -2,11 +2,13 @@
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import get_episode_data_index
 from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
+import hashlib
 import numpy as np
 from pathlib import Path
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 import os
+import threading
 from tqdm import tqdm
 from functools import partial
 import torch
@@ -32,6 +34,53 @@ _NMX_VISUAL_CONTRACTS = {
     UPSTREAM_SINGLE_CANVAS_VISUAL_CONTRACT,
     PER_VIEW_ZERO_PAD_VISUAL_CONTRACT,
 }
+_TEXT_EMB_OVERRIDE_CACHE = {}
+_TEXT_EMB_OVERRIDE_CACHE_LOCK = threading.Lock()
+
+
+def _load_text_emb_override(config):
+    override_path = getattr(config, "text_emb_override_path", None)
+    if not override_path:
+        return None
+
+    path = Path(override_path).expanduser().resolve()
+    with _TEXT_EMB_OVERRIDE_CACHE_LOCK:
+        cached = _TEXT_EMB_OVERRIDE_CACHE.get(path)
+        if cached is None:
+            if not path.is_file():
+                raise FileNotFoundError(f"Text embedding override not found: {path}")
+            tensor = torch.load(path, map_location="cpu", weights_only=False)
+            if not torch.is_tensor(tensor):
+                raise TypeError(
+                    f"Text embedding override must contain a tensor, got {type(tensor)!r}"
+                )
+            tensor = tensor.detach().cpu().contiguous()
+            digest = hashlib.sha256(
+                tensor.view(torch.uint8).numpy().tobytes()
+            ).hexdigest()
+            cached = (tensor, digest)
+            _TEXT_EMB_OVERRIDE_CACHE[path] = cached
+
+    tensor, digest = cached
+    expected_shape = getattr(config, "text_emb_override_shape", None)
+    if expected_shape is not None and tuple(tensor.shape) != tuple(expected_shape):
+        raise ValueError(
+            f"Text embedding override shape mismatch for {path}: "
+            f"expected {tuple(expected_shape)}, got {tuple(tensor.shape)}"
+        )
+    expected_dtype = getattr(config, "text_emb_override_dtype", None)
+    if expected_dtype is not None and str(tensor.dtype) != str(expected_dtype):
+        raise ValueError(
+            f"Text embedding override dtype mismatch for {path}: "
+            f"expected {expected_dtype}, got {tensor.dtype}"
+        )
+    expected_digest = getattr(config, "text_emb_override_sha256", None)
+    if expected_digest is not None and digest != expected_digest:
+        raise ValueError(
+            f"Text embedding override SHA-256 mismatch for {path}: "
+            f"expected {expected_digest}, got {digest}"
+        )
+    return tensor
 
 
 def _pad_latent_view_to_patch_size(latent, patch_size):
@@ -299,6 +348,7 @@ class LatentLeRobotDataset(LeRobotDataset):
                 config.empty_emb_path,
                 weights_only=False,
             )
+        self.text_emb_override = _load_text_emb_override(config)
         self.used_video_keys = config.obs_cam_keys
         if self.nmx_action_contract:
             norm_stat = load_action_norm_stats(self.root, config)
@@ -464,7 +514,9 @@ class LatentLeRobotDataset(LeRobotDataset):
         else:
             cat_latent = torch.cat(latent_lst, dim=2)
 
-        text_emb = data_dict[f"{self.used_video_keys[0]}.text_emb"]
+        text_emb = self.text_emb_override
+        if text_emb is None:
+            text_emb = data_dict[f"{self.used_video_keys[0]}.text_emb"]
         if self.empty_emb is not None and torch.rand(1).item() < self.cfg_prob:
             text_emb = self.empty_emb
 

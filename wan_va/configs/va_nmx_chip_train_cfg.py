@@ -21,8 +21,6 @@ _RECORDED_DATASET_PATHS = [
     "/mnt/workspace/shenyibo/datasets/chip_recovery_slide_0712_389episodes",
     "/mnt/workspace/shenyibo/datasets/chip_recovery_slide_672episodes",
     "/mnt/workspace/shenyibo/datasets/chip_reset_0709_454episodes",
-    "/mnt/workspace/shenyibo/rollout_data/lerobot/0713_rollout_pi05_umi_dual_arm_quat_mix0712_ABC_balanced_l0r4_plus_chip_l4r2e0",
-    "/mnt/workspace/shenyibo/rollout_data/lerobot/0715_merged_pi05_umi_dual_arm_chip_0712",
     "/mnt/workspace/shenyibo/datasets/waic_chip_0715",
 ]
 
@@ -38,6 +36,21 @@ va_nmx_chip_train_cfg.empty_emb_path = os.getenv(
     "NMX_CHIP_EMPTY_EMB_PATH",
     "/mnt/workspace/shenyibo/datasets/chip_0711_199episodes/empty_emb.pt",
 )
+va_nmx_chip_train_cfg.text_emb_override_path = os.getenv(
+    "NMX_CHIP_TEXT_EMB_OVERRIDE_PATH",
+    "/mnt/workspace/shenyibo/datasets/chip_paralle_0712_1048episodes/"
+    "meta/latent_generation_native_10fps/prompt_text_emb.pt",
+)
+va_nmx_chip_train_cfg.text_emb_override_shape = (512, 4096)
+va_nmx_chip_train_cfg.text_emb_override_dtype = "torch.bfloat16"
+va_nmx_chip_train_cfg.text_emb_override_sha256 = (
+    "04dd65d97b83e80e65594db57d6ddd5f58f0ec72d2734ab7768493ed745da5c5"
+)
+va_nmx_chip_train_cfg.task_prompt_override = """Hardware: 310
+Dataset: chip
+FPS: 10
+Action Space: state; 23d total; 7d left arm eef pose; 1d left gripper; 7d right arm eef pose; 1d right gripper; 7d head eef pose
+Task: Place the chip into the wooden box based on the soccer ball's position"""
 va_nmx_chip_train_cfg.wan22_pretrained_model_name_or_path = os.getenv(
     "LINGBOT_VA_MODEL_PATH",
     "/path/to/pretrained/model",
@@ -67,6 +80,10 @@ va_nmx_chip_train_cfg.window_size_min = 3
 va_nmx_chip_train_cfg.window_size_max = 3
 va_nmx_chip_train_cfg.chunk_grouping_start_from_one = True
 va_nmx_chip_train_cfg.max_latent_frames = 116
+va_nmx_chip_train_cfg.action_history_condition_dropout_prob = 1.0
+va_nmx_chip_train_cfg.action_history_condition_dropout_mode = (
+    "zero_normalized_clean_condition"
+)
 va_nmx_chip_train_cfg.relative_pose_frame = "local_frame"
 va_nmx_chip_train_cfg.quaternion_order = "wxyz"
 va_nmx_chip_train_cfg.relative_pose_groups = [
@@ -102,7 +119,7 @@ va_nmx_chip_train_cfg.action_snr_shift = 1.0
 va_nmx_chip_train_cfg.enable_wandb = False
 va_nmx_chip_train_cfg.load_worker = 4
 va_nmx_chip_train_cfg.num_init_worker = 8
-va_nmx_chip_train_cfg.save_interval = 1000
+va_nmx_chip_train_cfg.save_interval = 4000
 va_nmx_chip_train_cfg.gc_interval = 50
 va_nmx_chip_train_cfg.cfg_prob = 0.1
 va_nmx_chip_train_cfg.learning_rate = 1e-5
@@ -111,9 +128,10 @@ va_nmx_chip_train_cfg.beta2 = 0.95
 va_nmx_chip_train_cfg.weight_decay = 0.1
 va_nmx_chip_train_cfg.warmup_steps = 10
 va_nmx_chip_train_cfg.batch_size = 1
-va_nmx_chip_train_cfg.gradient_accumulation_steps = 4
+va_nmx_chip_train_cfg.gradient_accumulation_steps = 1
 va_nmx_chip_train_cfg.gradient_clipping = 2.0
-va_nmx_chip_train_cfg.num_steps = 10000
+va_nmx_chip_train_cfg.num_steps = 20000
+va_nmx_chip_train_cfg.seed = 42
 
 
 # A visual-only A/B control. All data, action, optimizer, and model settings are

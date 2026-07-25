@@ -1,4 +1,5 @@
 import json
+import hashlib
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,6 +11,7 @@ from wan_va.dataset.lerobot_latent_dataset import (
     PER_VIEW_ZERO_PAD_VISUAL_CONTRACT,
     UPSTREAM_SINGLE_CANVAS_VISUAL_CONTRACT,
     LatentLeRobotDataset,
+    _load_text_emb_override,
     compose_nmx_latent_views,
     discover_dataset_roots,
 )
@@ -107,6 +109,7 @@ def test_dataset_root_discovery_accepts_an_ordered_path_list(tmp_path):
 
 def _visual_config(visual_contract):
     return _config(
+        env_type="none",
         patch_size=(1, 2, 2),
         visual_contract=visual_contract,
         expected_latent_view_shapes=[(20, 15), (20, 15)],
@@ -167,6 +170,16 @@ def test_visual_ab_configs_differ_only_in_visual_contract():
 
     assert baseline.visual_contract == UPSTREAM_SINGLE_CANVAS_VISUAL_CONTRACT
     assert padded.visual_contract == PER_VIEW_ZERO_PAD_VISUAL_CONTRACT
+    assert len(baseline.dataset_path) == 13
+    assert all(path.startswith("/mnt/workspace/shenyibo/datasets/") for path in baseline.dataset_path)
+    assert baseline.gradient_accumulation_steps == 1
+    assert baseline.batch_size == 1
+    assert baseline.num_steps == 20000
+    assert baseline.save_interval == 4000
+    assert baseline.action_history_condition_dropout_prob == 1.0
+    assert baseline.action_history_condition_dropout_mode == (
+        "zero_normalized_clean_condition"
+    )
     baseline_values = dict(baseline)
     padded_values = dict(padded)
     for key in ("__name__", "visual_contract"):
@@ -183,6 +196,41 @@ def test_visual_ab_configs_differ_only_in_visual_contract():
     ):
         assert baseline[key] is not padded[key]
     assert baseline.relative_pose_groups[0] is not padded.relative_pose_groups[0]
+
+
+def test_text_embedding_override_is_loaded_once_and_replaces_cached_text(tmp_path):
+    override = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+    override_path = tmp_path / "prompt_text_emb.pt"
+    torch.save(override, override_path)
+    digest = hashlib.sha256(
+        override.contiguous().view(torch.uint8).numpy().tobytes()
+    ).hexdigest()
+    config = _visual_config(UPSTREAM_SINGLE_CANVAS_VISUAL_CONTRACT)
+    config.text_emb_override_path = str(override_path)
+    config.text_emb_override_shape = (3, 4)
+    config.text_emb_override_dtype = "torch.bfloat16"
+    config.text_emb_override_sha256 = digest
+
+    loaded = _load_text_emb_override(config)
+    assert _load_text_emb_override(config) is loaded
+
+    dataset = object.__new__(LatentLeRobotDataset)
+    dataset.config = config
+    dataset.nmx_action_contract = True
+    dataset.used_video_keys = ["left", "right"]
+    dataset.text_emb_override = loaded
+    dataset.empty_emb = None
+    dataset.cfg_prob = 0.0
+    data = {"left.text_emb": torch.full((3, 4), -1, dtype=torch.bfloat16)}
+    for key in dataset.used_video_keys:
+        data[f"{key}.latent"] = torch.ones(20 * 15, 1)
+        data[f"{key}.latent_num_frames"] = 1
+        data[f"{key}.latent_height"] = 20
+        data[f"{key}.latent_width"] = 15
+
+    sample = dataset._cat_video_latents(data)
+    assert sample["text_emb"] is loaded
+    torch.testing.assert_close(sample["text_emb"], override)
 
 
 def test_temporal_clip_keeps_latents_and_frame_ids_aligned(monkeypatch):

@@ -1,10 +1,13 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
 import os
+import random
 import sys
+import time
 from pathlib import Path
 import wandb
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -56,6 +59,51 @@ from wan_va.dataset.empty_embedding import generate_empty_embedding
 import gc
 
 
+def apply_action_history_condition_dropout(action_dict, probability):
+    """Zero normalized clean action-history samples without changing targets."""
+    probability = float(probability)
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError(
+            "action_history_condition_dropout_prob must be within [0, 1], "
+            f"got {probability}"
+        )
+
+    clean_action = action_dict["latent"]
+    batch_size = int(clean_action.shape[0])
+    if probability == 0.0:
+        return torch.zeros((), dtype=torch.int64, device=clean_action.device)
+    if probability == 1.0:
+        clean_action.zero_()
+        return torch.full(
+            (), batch_size, dtype=torch.int64, device=clean_action.device
+        )
+
+    drop_mask = torch.rand(batch_size, device=clean_action.device) < probability
+    clean_action.masked_fill_(
+        drop_mask.view(batch_size, *([1] * (clean_action.ndim - 1))),
+        0,
+    )
+    return drop_mask.sum()
+
+
+def append_metrics_jsonl(path, row):
+    """Durably append one optimizer-step metric row for MLflow sidecars."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=True, allow_nan=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def seed_training_process(seed, rank):
+    process_seed = int(seed) + int(rank)
+    random.seed(process_seed)
+    np.random.seed(process_seed)
+    torch.manual_seed(process_seed)
+    torch.cuda.manual_seed_all(process_seed)
+
+
 class Trainer:
     def __init__(self, config):
         if config.enable_wandb and config.rank == 0:
@@ -82,6 +130,30 @@ class Trainer:
         self.deepspeed_engine = None
         self.gradient_accumulation_steps = int(
             getattr(config, 'gradient_accumulation_steps', 1)
+        )
+        self.action_history_dropout_prob = float(
+            getattr(config, "action_history_condition_dropout_prob", 0.0)
+        )
+        action_history_dropout_mode = getattr(
+            config,
+            "action_history_condition_dropout_mode",
+            "zero_normalized_clean_condition",
+        )
+        if (
+            self.action_history_dropout_prob > 0.0
+            and action_history_dropout_mode != "zero_normalized_clean_condition"
+        ):
+            raise ValueError(
+                "Unsupported action-history dropout mode: "
+                f"{action_history_dropout_mode!r}"
+            )
+        if not 0.0 <= self.action_history_dropout_prob <= 1.0:
+            raise ValueError(
+                "action_history_condition_dropout_prob must be within [0, 1], "
+                f"got {self.action_history_dropout_prob}"
+            )
+        self._latest_action_history_dropped_samples = torch.zeros(
+            (), dtype=torch.int64, device=self.device
         )
 
         # Load models
@@ -150,7 +222,7 @@ class Trainer:
             num_replicas=config.world_size,
             rank=config.rank,
             shuffle=True,
-            seed=42
+            seed=int(getattr(config, "seed", 42)),
         ) if config.world_size > 1 else None
         self.train_loader = DataLoader(
             train_dataset,
@@ -165,7 +237,9 @@ class Trainer:
         self.train_scheduler_action = FlowMatchScheduler(shift=self.config.action_snr_shift, sigma_min=0.0, extra_one_step=True)
         self.train_scheduler_action.set_timesteps(1000, training=True)
 
-        self.save_dir = Path(config.save_root) / "checkpoints"
+        self.run_dir = Path(config.save_root)
+        self.metrics_path = self.run_dir / "metrics.jsonl"
+        self.save_dir = self.run_dir / "checkpoints"
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         self.train_loader_iter = None
@@ -326,6 +400,13 @@ class Trainer:
             action_mode=True,
             noisy_cond_prob=0.0)
 
+        self._latest_action_history_dropped_samples = (
+            apply_action_history_condition_dropout(
+                action_dict,
+                self.action_history_dropout_prob,
+            )
+        )
+
         latent_dict['text_emb'] = batch_dict['text_emb']
         action_dict['text_emb'] = batch_dict['text_emb']
         action_dict['actions_mask'] = batch_action_masks
@@ -414,6 +495,9 @@ class Trainer:
         losses = {
             'latent_loss': loss_payload['latent_loss_for_log'].detach(),
             'action_loss': loss_payload['action_loss_for_log'].detach(),
+            'action_history_dropped_samples': (
+                self._latest_action_history_dropped_samples.detach()
+            ),
         }
 
         if self._uses_deepspeed:
@@ -553,6 +637,7 @@ class Trainer:
         self.optimizer.zero_grad()
         accumulated_latent_losses = []
         accumulated_action_losses = []
+        accumulated_action_history_dropped_samples = []
         step_in_accumulation = 0
 
         while self.step < self.config.num_steps:
@@ -564,6 +649,9 @@ class Trainer:
             # Accumulate losses for logging
             accumulated_latent_losses.append(losses['latent_loss'])
             accumulated_action_losses.append(losses['action_loss'])
+            accumulated_action_history_dropped_samples.append(
+                losses['action_history_dropped_samples']
+            )
             step_in_accumulation += 1
 
             # Log and checkpoint when optimizer steps
@@ -575,10 +663,19 @@ class Trainer:
                 action_loss_show = dist_mean(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
                 max_latent_loss_show = dist_max(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
                 max_action_loss_show = dist_max(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
+                action_history_dropped_show = (
+                    dist_mean(
+                        torch.stack(accumulated_action_history_dropped_samples)
+                        .sum()
+                        .float()
+                    )
+                    * int(self.config.world_size)
+                ).detach().cpu().item()
 
                 # Clear accumulated losses
                 accumulated_latent_losses = []
                 accumulated_action_losses = []
+                accumulated_action_history_dropped_samples = []
                 step_in_accumulation = 0
 
                 torch.cuda.synchronize()
@@ -596,6 +693,37 @@ class Trainer:
                         'grad_norm': f'{total_norm.item():.2f}',
                         'lr': f'{lr:.2e}'
                     })
+                    metric_row = {
+                        'step': self.step,
+                        'loss_metrics/global_avg_video_loss': latent_loss_show,
+                        'loss_metrics/global_avg_action_loss': action_loss_show,
+                        'loss_metrics/global_max_video_loss': max_latent_loss_show,
+                        'loss_metrics/global_max_action_loss': max_action_loss_show,
+                        'grad_norm': total_norm.item(),
+                        'lr': lr,
+                        'train/sequence_parallel_size': 1,
+                        'train/data_parallel_world_size': int(self.config.world_size),
+                        'train/physical_world_size': int(self.config.world_size),
+                        'train/global_batch_size': (
+                            int(self.config.batch_size)
+                            * self.gradient_accumulation_steps
+                            * int(self.config.world_size)
+                        ),
+                        'train/action_history_condition_dropout_enabled': int(
+                            self.action_history_dropout_prob > 0.0
+                        ),
+                        'train/action_history_condition_dropout_prob': (
+                            self.action_history_dropout_prob
+                        ),
+                        'train/action_history_condition_dropout_dropped_samples': int(
+                            round(action_history_dropped_show)
+                        ),
+                        'data/allowed_max_latent_frames': int(
+                            getattr(self.config, 'max_latent_frames', 0)
+                        ),
+                        'timestamp': time.time(),
+                    }
+                    append_metrics_jsonl(self.metrics_path, metric_row)
                     if self.config.enable_wandb:
                         self.wandb.log({
                             'loss_metrics/global_avg_video_loss': latent_loss_show,
@@ -626,6 +754,9 @@ def run(args):
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
     init_distributed(world_size, local_rank, rank)
+
+    config.seed = int(getattr(config, "seed", 42))
+    seed_training_process(config.seed, rank)
 
     config.rank = rank
     config.local_rank = local_rank
