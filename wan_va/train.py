@@ -699,6 +699,11 @@ class Trainer:
 
                 if self.config.rank == 0:
                     total_norm = losses['total_norm']
+                    max_latent_frames = getattr(
+                        self.config,
+                        'max_latent_frames',
+                        0,
+                    )
                     progress_bar.n += 1
                     progress_bar.set_postfix({
                         'latent_loss': f'{latent_loss_show:.4f}',
@@ -732,8 +737,10 @@ class Trainer:
                         'train/action_history_condition_dropout_dropped_samples': int(
                             round(action_history_dropped_show)
                         ),
-                        'data/allowed_max_latent_frames': int(
-                            getattr(self.config, 'max_latent_frames', 0)
+                        'data/allowed_max_latent_frames': (
+                            None
+                            if max_latent_frames is None
+                            else int(max_latent_frames)
                         ),
                         'timestamp': time.time(),
                     }

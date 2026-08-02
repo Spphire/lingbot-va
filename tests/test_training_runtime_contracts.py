@@ -55,11 +55,14 @@ def test_action_history_dropout_rejects_invalid_probability():
 
 def test_metrics_jsonl_appends_one_json_object_per_step(tmp_path):
     path = tmp_path / "metrics.jsonl"
-    append_metrics_jsonl(path, {"step": 0, "lr": 1e-6})
+    append_metrics_jsonl(
+        path,
+        {"step": 0, "lr": 1e-6, "data/allowed_max_latent_frames": None},
+    )
     append_metrics_jsonl(path, {"step": 1, "lr": 2e-6})
 
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     assert rows == [
-        {"step": 0, "lr": 1e-6},
+        {"step": 0, "lr": 1e-6, "data/allowed_max_latent_frames": None},
         {"step": 1, "lr": 2e-6},
     ]
