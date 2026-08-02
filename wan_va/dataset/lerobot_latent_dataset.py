@@ -376,8 +376,25 @@ class LatentLeRobotDataset(LeRobotDataset):
 
     def parse_meta(self):
         out = []
+        configured_episode_indices = getattr(
+            self.config,
+            'episode_index_filter',
+            None,
+        )
+        episode_index_filter = (
+            {int(index) for index in configured_episode_indices}
+            if configured_episode_indices is not None
+            else None
+        )
+        if episode_index_filter is not None and not episode_index_filter:
+            raise ValueError("episode_index_filter must not be empty")
         for key, value in self.meta.episodes.items():
             episode_index = value["episode_index"]
+            if (
+                episode_index_filter is not None
+                and int(episode_index) not in episode_index_filter
+            ):
+                continue
             tasks = value["tasks"]
             action_config = value["action_config"]
             for acfg in action_config:
@@ -403,6 +420,14 @@ class LatentLeRobotDataset(LeRobotDataset):
 
                 if check_statu:
                     out.append(cur_meta)
+        if episode_index_filter is not None:
+            selected = {int(meta["episode_index"]) for meta in out}
+            missing = episode_index_filter - selected
+            if missing:
+                raise ValueError(
+                    "episode_index_filter selected no usable latent segment for "
+                    f"episode indices {sorted(missing)}"
+                )
         self.new_metas = out
 
     def _check_meta(self, start_frame, end_frame, episode_index):
