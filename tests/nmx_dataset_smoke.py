@@ -21,7 +21,11 @@ def main():
     parser.add_argument("--all-recorded", action="store_true")
     parser.add_argument(
         "--config-name",
-        choices=("nmx_chip_train", "nmx_chip_train_per_view_pad"),
+        choices=(
+            "nmx_chip_train",
+            "nmx_chip_train_per_view_pad",
+            "nmx_chip_episode109_overfit",
+        ),
         default="nmx_chip_train",
     )
     args = parser.parse_args()
@@ -34,7 +38,8 @@ def main():
     sample = dataset[args.sample_index]
     batch = next(iter(DataLoader(dataset, batch_size=1, num_workers=0)))
 
-    assert sample["latents"].shape[1] <= config.max_latent_frames
+    if config.max_latent_frames is not None:
+        assert sample["latents"].shape[1] <= config.max_latent_frames
     assert sample["raw_actions"].shape == sample["raw_states"].shape
     assert sample["raw_actions"].shape[-1] == 23
     assert not sample["raw_actions_step_mask"][0].any()
