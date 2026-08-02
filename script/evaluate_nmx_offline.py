@@ -125,29 +125,13 @@ def _sample_metadata(
     return meta
 
 
-def select_distinct_episode_samples(
+def shuffled_sample_candidates(
     dataset: MultiLatentLeRobotDataset,
-    count: int,
     seed: int,
-) -> list[int]:
+):
     candidates = list(range(len(dataset)))
     random.Random(seed).shuffle(candidates)
-    selected: list[int] = []
-    seen: set[tuple[str, int]] = set()
-    for index in candidates:
-        meta = _sample_metadata(dataset, index)
-        key = (str(meta["dataset_root"]), int(meta["episode_index"]))
-        if key in seen:
-            continue
-        seen.add(key)
-        selected.append(index)
-        if len(selected) == count:
-            break
-    if len(selected) != count:
-        raise ValueError(
-            f"Requested {count} distinct episodes but found only {len(selected)}"
-        )
-    return selected
+    yield from candidates
 
 
 def _as_embedding(value: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -179,6 +163,10 @@ def denormalize_ground_truth(
     selected = action[used_ids].permute(1, 2, 0).reshape(-1, len(used_ids))
     selected_mask = mask[used_ids].permute(1, 2, 0).reshape(-1, len(used_ids))
     return selected.numpy(), selected_mask.numpy()
+
+
+def has_valid_evaluation_target(mask: np.ndarray) -> bool:
+    return bool(np.any(mask))
 
 
 def _quat_angle_rad(prediction: np.ndarray, target: np.ndarray) -> np.ndarray:
@@ -308,13 +296,12 @@ def main() -> None:
         config=config,
         num_init_worker=int(args.num_init_worker),
     )
-    indices = (
-        [int(value) for value in args.sample_index]
-        if args.sample_index
-        else select_distinct_episode_samples(dataset, args.episodes, args.seed)
-    )
-    if any(index < 0 or index >= len(dataset) for index in indices):
-        raise IndexError(f"Sample indices out of range for dataset length {len(dataset)}: {indices}")
+    explicit_indices = [int(value) for value in args.sample_index] if args.sample_index else None
+    if explicit_indices and any(index < 0 or index >= len(dataset) for index in explicit_indices):
+        raise IndexError(
+            f"Sample indices out of range for dataset length {len(dataset)}: "
+            f"{explicit_indices}"
+        )
 
     server = OfflineActionServer(config)
     empty_embedding = _load_empty_embedding(Path(config.empty_emb_path))
@@ -322,10 +309,38 @@ def main() -> None:
     all_prediction: list[np.ndarray] = []
     all_target: list[np.ndarray] = []
     all_mask: list[np.ndarray] = []
+    skipped_without_targets = 0
+    selected_episodes: set[tuple[str, int]] = set()
 
-    for ordinal, sample_index in enumerate(indices):
-        sample = dataset[sample_index]
+    if explicit_indices is not None:
+        candidates = iter(explicit_indices)
+        requested_samples = len(explicit_indices)
+    else:
+        candidates = shuffled_sample_candidates(dataset, args.seed)
+        requested_samples = int(args.episodes)
+
+    for sample_index in candidates:
         metadata = _sample_metadata(dataset, sample_index)
+        episode_key = (
+            str(metadata["dataset_root"]),
+            int(metadata["episode_index"]),
+        )
+        if explicit_indices is None and episode_key in selected_episodes:
+            continue
+        sample = dataset[sample_index]
+        target, mask = denormalize_ground_truth(sample, config)
+        if not has_valid_evaluation_target(mask):
+            if explicit_indices is not None:
+                raise ValueError(
+                    f"Sample index {sample_index} has no valid action targets in the "
+                    "evaluation window"
+                )
+            skipped_without_targets += 1
+            continue
+        if explicit_indices is None:
+            selected_episodes.add(episode_key)
+
+        ordinal = len(records)
         server._reset(prompt=None)
         server.prompt_embeds = _as_embedding(sample["text_emb"], server.device, server.dtype)
         server.negative_prompt_embeds = _as_embedding(empty_embedding, server.device, server.dtype)
@@ -336,7 +351,6 @@ def main() -> None:
         torch.manual_seed(args.seed + ordinal)
         action, _latents = server._infer({}, frame_st_id=0)
         prediction = flatten_server_action(np.asarray(action))
-        target, mask = denormalize_ground_truth(sample, config)
         if prediction.shape != target.shape:
             raise ValueError(
                 f"Prediction/target shape mismatch: {prediction.shape} != {target.shape}"
@@ -361,6 +375,14 @@ def main() -> None:
         all_prediction.append(prediction)
         all_target.append(target)
         all_mask.append(mask)
+        if len(records) == requested_samples:
+            break
+
+    if len(records) != requested_samples:
+        raise ValueError(
+            f"Requested {requested_samples} samples with valid action targets but found "
+            f"only {len(records)}; skipped {skipped_without_targets} invalid windows"
+        )
 
     aggregate = compute_metrics(
         np.concatenate(all_prediction),
@@ -376,6 +398,7 @@ def main() -> None:
         "dataset_roots": list(config.dataset_path),
         "seed": int(args.seed),
         "evaluated_episodes": len(records),
+        "skipped_windows_without_valid_targets": skipped_without_targets,
         "ignored_condition_steps_per_window": int(config.action_per_frame),
         "control_fps": float(config.control_fps),
         "aggregate": aggregate,

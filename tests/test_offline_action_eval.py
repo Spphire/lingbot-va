@@ -3,7 +3,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from script.evaluate_nmx_offline import compute_metrics, flatten_server_action
+from script.evaluate_nmx_offline import (
+    compute_metrics,
+    flatten_server_action,
+    has_valid_evaluation_target,
+)
 
 
 def test_flatten_server_action_preserves_frame_step_order() -> None:
@@ -44,3 +48,10 @@ def test_compute_metrics_reports_quaternion_geodesic_error() -> None:
 
     assert metrics["left_rotation_mae_rad"] == pytest.approx(np.pi)
     assert metrics["right_rotation_mae_rad"] == pytest.approx(np.pi)
+
+
+def test_valid_evaluation_target_requires_at_least_one_unmasked_value() -> None:
+    assert not has_valid_evaluation_target(np.zeros((48, 16), dtype=bool))
+    mask = np.zeros((48, 16), dtype=bool)
+    mask[12, 0] = True
+    assert has_valid_evaluation_target(mask)
