@@ -78,6 +78,14 @@ def test_split_episode_chunks_excludes_condition_once_and_keeps_tail() -> None:
         grouping_start_from_one=True,
     )
 
+    assert condition_latent.flatten().tolist() == [0]
+    assert condition_action.flatten().tolist() == [0]
+    assert [chunk.start_latent for chunk in chunks] == [1, 5, 9]
+    assert [chunk.latent.shape[1] for chunk in chunks] == [4, 4, 1]
+    assert torch.cat([chunk.latent for chunk in chunks], dim=1).flatten().tolist() == list(
+        range(1, 10)
+    )
+
 
 def test_deployment_native_first_chunk_masks_only_condition_action_latent() -> None:
     sample = {
@@ -95,14 +103,6 @@ def test_deployment_native_first_chunk_masks_only_condition_action_latent() -> N
     assert target.shape == (1, 4, 12, 1)
     assert not mask[:, 0].any()
     assert mask[:, 1:].all()
-
-    assert condition_latent.flatten().tolist() == [0]
-    assert condition_action.flatten().tolist() == [0]
-    assert [chunk.start_latent for chunk in chunks] == [1, 5, 9]
-    assert [chunk.latent.shape[1] for chunk in chunks] == [4, 4, 1]
-    assert torch.cat([chunk.latent for chunk in chunks], dim=1).flatten().tolist() == list(
-        range(1, 10)
-    )
 
 
 def test_denormalize_action_and_plot_bounds_use_physical_channel_scale() -> None:
