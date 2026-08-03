@@ -307,6 +307,7 @@ def test_temporal_clip_keeps_latents_and_frame_ids_aligned(monkeypatch):
 
 def test_episode_metadata_applies_pose_and_gripper_validity():
     dataset = object.__new__(LatentLeRobotDataset)
+    dataset.config = _config()
     dataset.nmx_action_contract = True
     dataset.meta = SimpleNamespace(
         episodes={
