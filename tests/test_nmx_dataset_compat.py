@@ -198,6 +198,32 @@ def test_visual_ab_configs_differ_only_in_visual_contract():
     assert baseline.relative_pose_groups[0] is not padded.relative_pose_groups[0]
 
 
+def test_fastwam_visual_ab_configs_change_only_action_mode_and_visual_contract():
+    idm_baseline = VA_CONFIGS["nmx_chip_train"]
+    fastwam_baseline = VA_CONFIGS["nmx_chip_train_fastwam"]
+    fastwam_padded = VA_CONFIGS["nmx_chip_train_per_view_pad_fastwam"]
+
+    assert idm_baseline.action_condition_mode == "inverse_dynamics"
+    assert fastwam_baseline.action_condition_mode == "fastwam"
+    assert fastwam_padded.action_condition_mode == "fastwam"
+    assert fastwam_baseline.visual_contract == UPSTREAM_SINGLE_CANVAS_VISUAL_CONTRACT
+    assert fastwam_padded.visual_contract == PER_VIEW_ZERO_PAD_VISUAL_CONTRACT
+
+    idm_values = dict(idm_baseline)
+    fastwam_values = dict(fastwam_baseline)
+    for key in ("__name__", "action_condition_mode"):
+        idm_values.pop(key, None)
+        fastwam_values.pop(key, None)
+    assert idm_values == fastwam_values
+
+    baseline_values = dict(fastwam_baseline)
+    padded_values = dict(fastwam_padded)
+    for key in ("__name__", "visual_contract"):
+        baseline_values.pop(key, None)
+        padded_values.pop(key, None)
+    assert baseline_values == padded_values
+
+
 def test_text_embedding_override_is_loaded_once_and_replaces_cached_text(tmp_path):
     override = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
     override_path = tmp_path / "prompt_text_emb.pt"

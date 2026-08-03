@@ -103,6 +103,7 @@ class FlexAttnFunc(nn.Module):
         patch_size,
         device,
         chunk_grouping_start_from_one=False,
+        action_condition_mode="inverse_dynamics",
     ):
         torch._inductor.config.realize_opcount_threshold = 100
         B, _, L_F, L_H, L_W = latent_shape
@@ -128,6 +129,9 @@ class FlexAttnFunc(nn.Module):
         frame_ids = torch.cat(
             [latent_chunk_id * 2] * 2 + [action_chunk_id * 2 + 1] * 2
         )
+        chunk_ids = torch.cat(
+            [latent_chunk_id] * 2 + [action_chunk_id] * 2
+        )
 
         noise_ids = torch.cat(
             [
@@ -137,12 +141,30 @@ class FlexAttnFunc(nn.Module):
                 torch.ones_like(action_frame_id),
             ]
         )
+        modality_ids = torch.cat(
+            [
+                torch.zeros_like(latent_frame_id),
+                torch.zeros_like(latent_frame_id),
+                torch.ones_like(action_frame_id),
+                torch.ones_like(action_frame_id),
+            ]
+        )
 
         seq_ids = F.pad(seq_ids, (0, padded_length), value=-1)
         frame_ids = F.pad(frame_ids, (0, padded_length), value=-1)
+        chunk_ids = F.pad(chunk_ids, (0, padded_length), value=-1)
         noise_ids = F.pad(noise_ids, (0, padded_length), value=-1)
+        modality_ids = F.pad(modality_ids, (0, padded_length), value=-1)
 
-        mask_mod = FlexAttnFunc._get_mask_mod(seq_ids.long().to(device), frame_ids.long().to(device), noise_ids.long().to(device), window_size)
+        mask_mod = FlexAttnFunc._get_mask_mod(
+            seq_ids.long().to(device),
+            frame_ids.long().to(device),
+            noise_ids.long().to(device),
+            chunk_ids.long().to(device),
+            modality_ids.long().to(device),
+            window_size,
+            action_condition_mode=action_condition_mode,
+        )
         block_mask = FlexAttnFunc.compiled_create_block_mask(
                 mask_mod, 1, 1, len(seq_ids), len(seq_ids), device=device, _compile=True
             )
@@ -166,7 +188,15 @@ class FlexAttnFunc(nn.Module):
     
     @staticmethod
     @torch.no_grad()
-    def _get_mask_mod(seq_ids, frame_ids, noise_ids, window_size):
+    def _get_mask_mod(
+        seq_ids,
+        frame_ids,
+        noise_ids,
+        chunk_ids,
+        modality_ids,
+        window_size,
+        action_condition_mode="inverse_dynamics",
+    ):
         def seq_mask(
             b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
         ):
@@ -206,11 +236,25 @@ class FlexAttnFunc(nn.Module):
         ):
             return ((frame_ids[q_idx] - frame_ids[kv_idx]).abs() <= window_size)
 
+        def action_no_current_clean_video_mask(
+            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+        ):
+            blocked = (
+                (noise_ids[q_idx] == 0)
+                & (modality_ids[q_idx] == 1)
+                & (noise_ids[kv_idx] == 1)
+                & (modality_ids[kv_idx] == 0)
+                & (chunk_ids[q_idx] == chunk_ids[kv_idx])
+            )
+            return ~blocked
+
         mask_list = []
         mask_list.append(and_masks(clean2clean_mask, block_causal_mask))
         mask_list.append(and_masks(noise2clean_mask, block_causal_mask_exclude_self))
         mask_list.append(and_masks(noise2noise_mask, block_self_mask))
         mask = or_masks(*mask_list)
+        if action_condition_mode == "fastwam":
+            mask = and_masks(mask, action_no_current_clean_video_mask)
         mask = and_masks(mask, seq_mask)
         mask = and_masks(mask, partial(block_window_mask, window_size=window_size))
         return mask
@@ -630,11 +674,17 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                  eps=1e-06,
                  rope_max_seq_len=1024,
                  pos_embed_seq_len=None,
-                 attn_mode="torch"):
+                 attn_mode="torch",
+                 action_condition_mode="inverse_dynamics"):
         r"""
         TODO
         """
         super().__init__()
+        if action_condition_mode not in {"inverse_dynamics", "fastwam"}:
+            raise ValueError(
+                "action_condition_mode must be 'inverse_dynamics' or 'fastwam', "
+                f"got {action_condition_mode!r}"
+            )
         self.patch_size = patch_size
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
@@ -792,6 +842,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                chunk_grouping_start_from_one=input_dict.get(
                                    'chunk_grouping_start_from_one', False
                                ),
+                               action_condition_mode=self.config.action_condition_mode,
                                )
 
         for block in self.blocks:

@@ -175,7 +175,10 @@ class Trainer:
             transformer_path,
             torch_dtype=torch.float32,
             torch_device='cpu',
-            attn_mode="flex"
+            attn_mode="flex",
+            action_condition_mode=str(
+                getattr(config, "action_condition_mode", "inverse_dynamics")
+            ),
         )
 
         logger.info("Setting up activation checkpointing ...")

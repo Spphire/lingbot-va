@@ -19,6 +19,7 @@ def _config(tmp_path: Path) -> dict:
         "wan22_pretrained_model_name_or_path": str(tmp_path / "base"),
         "param_dtype": "torch.bfloat16",
         "patch_size": [1, 2, 2],
+        "action_condition_mode": "fastwam",
         "visual_contract": "upstream_single_canvas_v1",
         "expected_latent_view_shapes": [[20, 15], [20, 15]],
         "expected_latent_channels": 48,
@@ -82,6 +83,7 @@ def test_run_and_checkpoint_contracts_are_self_describing(tmp_path, monkeypatch)
     deployment = json.loads((run / "deployment_manifest.json").read_text())
     assert resolved["config"]["action_norm_method"] == "quantiles"
     assert deployment["policy_contract"]["action_norm_method"] == "quantiles"
+    assert deployment["policy_contract"]["action_condition_mode"] == "fastwam"
     assert deployment["policy_contract"]["latent_canvas_hw"] == [20, 30]
     assert deployment["policy_contract"]["visual_tokens_per_frame"] == 150
     assert deployment["resolved_train_config"]["sha256"] == sha256_file(
@@ -89,6 +91,7 @@ def test_run_and_checkpoint_contracts_are_self_describing(tmp_path, monkeypatch)
     )
     run_manifest = json.loads((run / "run_manifest.json").read_text())
     assert run_manifest["provenance"] == "native"
+    assert run_manifest["action_condition_mode"] == "fastwam"
     assert run_manifest["deployment_manifest"]["sha256"] == contract[
         "deployment_manifest_sha256"
     ]
