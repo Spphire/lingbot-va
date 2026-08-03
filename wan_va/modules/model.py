@@ -454,24 +454,29 @@ class WanAttention(torch.nn.Module):
                 return x_out.to(x.dtype)
             query = apply_rotary_emb(query, rotary_emb)
             key = apply_rotary_emb(key, rotary_emb)
-        slots = None
         if kv_cache is not None and kv_cache['k'] is not None:
-            slots = self.update_cache(cache_name,
-                                      key,
-                                      value,
-                                      is_pred=(update_cache == 1))
-            key_pool = self.attn_caches[cache_name]['k']
-            value_pool = self.attn_caches[cache_name]['v']
-            mask = self.attn_caches[cache_name]['mask']
-            valid = mask.nonzero(as_tuple=False).squeeze(-1)
-            key = key_pool[:, valid]
-            value = value_pool[:, valid]
+            cache = self.attn_caches[cache_name]
+            valid = cache['mask'].nonzero(as_tuple=False).squeeze(-1)
+            if update_cache == 0:
+                # Denoising queries are transient. Appending them through update_cache()
+                # evicts the committed context before attention when the cache is full.
+                # Keep persistent history untouched and expose history + current K/V only
+                # for this attention call.
+                if valid.numel() > 0:
+                    key = torch.cat([cache['k'][:, valid], key], dim=1)
+                    value = torch.cat([cache['v'][:, valid], value], dim=1)
+            else:
+                self.update_cache(
+                    cache_name,
+                    key,
+                    value,
+                    is_pred=(update_cache == 1),
+                )
+                valid = cache['mask'].nonzero(as_tuple=False).squeeze(-1)
+                key = cache['k'][:, valid]
+                value = cache['v'][:, valid]
 
         hidden_states = self.attn_op(query, key, value)
-
-        if update_cache == 0:
-            if kv_cache is not None and kv_cache['k'] is not None:
-                self.restore_cache(cache_name, slots)
 
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
