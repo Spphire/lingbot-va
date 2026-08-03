@@ -498,6 +498,172 @@ def _quat_angle_rad(prediction: np.ndarray, target: np.ndarray) -> np.ndarray:
     return 2.0 * np.arccos(np.clip(dot, 0.0, 1.0))
 
 
+def _normalize_quaternion_xyzw(quaternion: np.ndarray) -> np.ndarray:
+    norm = np.linalg.norm(quaternion, axis=-1, keepdims=True)
+    identity = np.zeros_like(quaternion)
+    identity[..., 3] = 1.0
+    return np.where(norm > 1e-12, quaternion / np.clip(norm, 1e-12, None), identity)
+
+
+def _quaternion_multiply_xyzw(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    left_xyz, left_w = left[..., :3], left[..., 3:4]
+    right_xyz, right_w = right[..., :3], right[..., 3:4]
+    xyz = (
+        left_w * right_xyz
+        + right_w * left_xyz
+        + np.cross(left_xyz, right_xyz)
+    )
+    w = left_w * right_w - np.sum(left_xyz * right_xyz, axis=-1, keepdims=True)
+    return np.concatenate([xyz, w], axis=-1)
+
+
+def _quaternion_apply_xyzw(quaternion: np.ndarray, vector: np.ndarray) -> np.ndarray:
+    quaternion = _normalize_quaternion_xyzw(quaternion)
+    quat_xyz, quat_w = quaternion[..., :3], quaternion[..., 3:4]
+    uv = np.cross(quat_xyz, vector)
+    uuv = np.cross(quat_xyz, uv)
+    return vector + 2.0 * (quat_w * uv + uuv)
+
+
+def _source_quaternion_to_xyzw(quaternion: np.ndarray, order: str) -> np.ndarray:
+    if order == "xyzw":
+        return quaternion
+    if order == "wxyz":
+        return np.concatenate([quaternion[..., 1:4], quaternion[..., 0:1]], axis=-1)
+    raise ValueError(f"Unsupported quaternion_order={order!r}")
+
+
+def _align_quaternion_curves(
+    prediction: np.ndarray,
+    target: np.ndarray,
+    pose_bases: tuple[int, ...],
+) -> None:
+    for base in pose_bases:
+        target_quat = _normalize_quaternion_xyzw(target[:, base + 3 : base + 7])
+        for index in range(1, len(target_quat)):
+            if np.dot(target_quat[index - 1], target_quat[index]) < 0:
+                target_quat[index] *= -1
+        prediction_quat = _normalize_quaternion_xyzw(
+            prediction[:, base + 3 : base + 7]
+        )
+        opposite = np.sum(prediction_quat * target_quat, axis=-1) < 0
+        prediction_quat[opposite] *= -1
+        target[:, base + 3 : base + 7] = target_quat
+        prediction[:, base + 3 : base + 7] = prediction_quat
+
+
+def reconstruct_absolute_episode_actions(
+    relative_prediction: np.ndarray,
+    sample: dict[str, torch.Tensor],
+    chunks: list[EpisodeChunk],
+    config: Any,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map chunk-relative predictions back to absolute EEF trajectories."""
+
+    raw_actions = torch.as_tensor(sample["raw_actions"]).cpu().numpy()
+    raw_states = torch.as_tensor(sample["raw_states"]).cpu().numpy()
+    raw_mask = torch.as_tensor(sample["raw_actions_step_mask"]).cpu().numpy().astype(bool)
+    if raw_actions.shape != raw_states.shape or raw_actions.shape[:2] != raw_mask.shape:
+        raise ValueError("Raw action/state/mask shapes do not match")
+
+    flat_actions = raw_actions.reshape(-1, raw_actions.shape[-1])
+    flat_states = raw_states.reshape(-1, raw_states.shape[-1])
+    flat_mask = raw_mask.reshape(-1)
+    actions_per_latent = int(raw_actions.shape[1])
+    groups = list(config.relative_pose_groups)
+    output_width = sum(
+        int(group["pose_slice"][1]) - int(group["pose_slice"][0])
+        + (
+            int(group["gripper_slice"][1]) - int(group["gripper_slice"][0])
+            if group.get("gripper_slice") is not None
+            else 0
+        )
+        for group in groups
+    )
+    if relative_prediction.ndim != 2 or relative_prediction.shape[1] != output_width:
+        raise ValueError(
+            f"Expected relative prediction [steps,{output_width}], got "
+            f"{relative_prediction.shape}"
+        )
+
+    absolute_prediction = np.zeros_like(relative_prediction)
+    absolute_target = np.zeros_like(relative_prediction)
+    cursor = 0
+    pose_bases: list[int] = []
+    source_quaternion_order = str(config.quaternion_order)
+    relative_pose_frame = str(config.relative_pose_frame)
+    for chunk in chunks:
+        chunk_steps = int(chunk.action.shape[1] * chunk.action.shape[2])
+        source_start = int(chunk.start_latent) * actions_per_latent
+        source_end = source_start + chunk_steps
+        valid_indices = np.flatnonzero(flat_mask[source_start:source_end])
+        if valid_indices.size == 0:
+            cursor += chunk_steps
+            continue
+        anchor_index = source_start + int(valid_indices[0])
+        output_base = 0
+        for group in groups:
+            pose_start, pose_end = (int(value) for value in group["pose_slice"])
+            if pose_end - pose_start != 7:
+                raise ValueError("Absolute plotting requires 7D xyz+quaternion poses")
+            pose_bases.append(output_base)
+            anchor_pose = flat_states[anchor_index, pose_start:pose_end]
+            anchor_position = anchor_pose[:3]
+            anchor_quaternion = _normalize_quaternion_xyzw(
+                _source_quaternion_to_xyzw(
+                    anchor_pose[3:7][None], source_quaternion_order
+                )
+            )[0]
+
+            relative_pose = relative_prediction[cursor : cursor + chunk_steps, output_base : output_base + 7]
+            if relative_pose_frame == "local_frame":
+                absolute_position = anchor_position + _quaternion_apply_xyzw(
+                    np.broadcast_to(anchor_quaternion, (chunk_steps, 4)),
+                    relative_pose[:, :3],
+                )
+            elif relative_pose_frame == "world_frame":
+                absolute_position = anchor_position + relative_pose[:, :3]
+            else:
+                raise ValueError(f"Unsupported relative_pose_frame={relative_pose_frame!r}")
+            absolute_quaternion = _normalize_quaternion_xyzw(
+                _quaternion_multiply_xyzw(
+                    np.broadcast_to(anchor_quaternion, (chunk_steps, 4)),
+                    _normalize_quaternion_xyzw(relative_pose[:, 3:7]),
+                )
+            )
+            absolute_prediction[cursor : cursor + chunk_steps, output_base : output_base + 3] = absolute_position
+            absolute_prediction[cursor : cursor + chunk_steps, output_base + 3 : output_base + 7] = absolute_quaternion
+
+            target_pose = flat_actions[source_start:source_end, pose_start:pose_end]
+            absolute_target[cursor : cursor + chunk_steps, output_base : output_base + 3] = target_pose[:, :3]
+            absolute_target[cursor : cursor + chunk_steps, output_base + 3 : output_base + 7] = _normalize_quaternion_xyzw(
+                _source_quaternion_to_xyzw(target_pose[:, 3:7], source_quaternion_order)
+            )
+            output_base += 7
+            gripper_slice = group.get("gripper_slice")
+            if gripper_slice is not None:
+                grip_start, grip_end = (int(value) for value in gripper_slice)
+                grip_width = grip_end - grip_start
+                absolute_prediction[cursor : cursor + chunk_steps, output_base : output_base + grip_width] = relative_prediction[
+                    cursor : cursor + chunk_steps, output_base : output_base + grip_width
+                ]
+                absolute_target[cursor : cursor + chunk_steps, output_base : output_base + grip_width] = flat_actions[
+                    source_start:source_end, grip_start:grip_end
+                ]
+                output_base += grip_width
+        cursor += chunk_steps
+    if cursor != len(relative_prediction):
+        raise ValueError(
+            f"Chunk steps {cursor} do not cover prediction length {len(relative_prediction)}"
+        )
+    _align_quaternion_curves(
+        absolute_prediction,
+        absolute_target,
+        tuple(sorted(set(pose_bases))),
+    )
+    return absolute_prediction, absolute_target
+
+
 def compute_metrics(
     prediction: np.ndarray,
     target: np.ndarray,
@@ -549,9 +715,11 @@ def _plot_curves(
     target: np.ndarray,
     mask: np.ndarray,
     control_fps: float,
-    lower_bounds: np.ndarray,
-    upper_bounds: np.ndarray,
+    lower_bounds: np.ndarray | None,
+    upper_bounds: np.ndarray | None,
     chunk_boundaries: list[int],
+    *,
+    title: str,
 ) -> None:
     time_s = np.arange(prediction.shape[0], dtype=np.float64) / float(control_fps)
     figure, axes = plt.subplots(4, 4, figsize=(18, 12), sharex=True)
@@ -574,13 +742,15 @@ def _plot_curves(
                 linewidth=0.8,
                 alpha=0.3,
             )
-        axis.set_ylim(float(lower_bounds[index]), float(upper_bounds[index]))
+        if lower_bounds is not None and upper_bounds is not None:
+            axis.set_ylim(float(lower_bounds[index]), float(upper_bounds[index]))
         axis.set_title(name)
         axis.grid(alpha=0.25)
     axes[0, 0].legend(loc="best", fontsize=8)
     for axis in axes[-1, :]:
         axis.set_xlabel("time (s)")
-    figure.tight_layout()
+    figure.suptitle(title)
+    figure.tight_layout(rect=(0, 0, 1, 0.97))
     figure.savefig(path, dpi=160)
     plt.close(figure)
 
@@ -872,16 +1042,30 @@ def main() -> None:
         mask = np.concatenate(masks)
         metrics = compute_metrics(prediction, target, mask)
         stem = f"sample_{sample_index:06d}_episode_{int(metadata['episode_index']):06d}"
+        artifact_arrays: dict[str, np.ndarray] = {
+            "prediction": prediction,
+            "target": target,
+            "mask": mask,
+            "channel_names": np.asarray(CHANNEL_NAMES),
+            "lower_bounds": lower_bounds,
+            "upper_bounds": upper_bounds,
+            "chunk_boundaries": np.asarray(chunk_boundaries, dtype=np.int64),
+            "condition_action_steps": np.asarray(int(config.action_per_frame)),
+        }
+        absolute_prediction = None
+        absolute_target = None
+        if not native_first_chunk and not native_episode:
+            absolute_prediction, absolute_target = reconstruct_absolute_episode_actions(
+                prediction,
+                sample,
+                chunks,
+                config,
+            )
+            artifact_arrays["absolute_prediction"] = absolute_prediction
+            artifact_arrays["absolute_target"] = absolute_target
         np.savez_compressed(
             output_dir / f"{stem}.npz",
-            prediction=prediction,
-            target=target,
-            mask=mask,
-            channel_names=np.asarray(CHANNEL_NAMES),
-            lower_bounds=lower_bounds,
-            upper_bounds=upper_bounds,
-            chunk_boundaries=np.asarray(chunk_boundaries, dtype=np.int64),
-            condition_action_steps=np.asarray(int(config.action_per_frame)),
+            **artifact_arrays,
         )
         _plot_curves(
             output_dir / f"{stem}.png",
@@ -892,7 +1076,20 @@ def main() -> None:
             lower_bounds,
             upper_bounds,
             chunk_boundaries,
+            title="Chunk-relative action",
         )
+        if absolute_prediction is not None and absolute_target is not None:
+            _plot_curves(
+                output_dir / f"{stem}_absolute.png",
+                absolute_prediction,
+                absolute_target,
+                mask,
+                float(config.control_fps),
+                None,
+                None,
+                chunk_boundaries,
+                title="Absolute end-effector trajectory",
+            )
         valid_steps = np.any(mask, axis=1)
         if native_first_chunk:
             condition_latent_frames = 1

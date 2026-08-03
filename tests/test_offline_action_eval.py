@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from script.evaluate_nmx_offline import (
+    EpisodeChunk,
     compute_metrics,
     denormalize_training_action,
     deployment_native_first_chunk_target,
@@ -14,6 +15,7 @@ from script.evaluate_nmx_offline import (
     has_valid_evaluation_target,
     physical_action_bounds,
     rebuild_sample_actions_for_chunk_size,
+    reconstruct_absolute_episode_actions,
     resolve_action_history_mode,
     split_deployment_native_windows,
     split_episode_chunks,
@@ -155,6 +157,57 @@ def test_rebuild_sample_actions_uses_requested_chunk_anchor() -> None:
     # Frame 3 starts a new K=2 chunk but remains inside the first K=4 chunk.
     assert rebuilt_k2["actions"][0, 3, 0, 0].item() == pytest.approx(0.0, abs=1e-6)
     assert rebuilt_k4["actions"][0, 3, 0, 0].item() == pytest.approx(0.2)
+
+
+def test_absolute_reconstruction_uses_local_frame_chunk_anchor() -> None:
+    root_half = 2.0**-0.5
+    raw_actions = torch.zeros(3, 1, 8)
+    raw_states = torch.zeros_like(raw_actions)
+    anchor_wxyz = torch.tensor([root_half, 0.0, 0.0, root_half])
+    raw_states[1:, 0, :3] = torch.tensor([1.0, 2.0, 3.0])
+    raw_states[1:, 0, 3:7] = anchor_wxyz
+    raw_actions[1, 0, :3] = torch.tensor([1.0, 2.0, 3.0])
+    raw_actions[2, 0, :3] = torch.tensor([1.0, 3.0, 3.0])
+    raw_actions[1:, 0, 3:7] = anchor_wxyz
+    raw_actions[1, 0, 7] = 0.1
+    raw_actions[2, 0, 7] = 0.2
+    sample = {
+        "raw_actions": raw_actions,
+        "raw_states": raw_states,
+        "raw_actions_step_mask": torch.ones(3, 1, dtype=torch.bool),
+    }
+    relative_prediction = np.asarray(
+        [
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.1],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.2],
+        ],
+        dtype=np.float32,
+    )
+    chunks = [
+        EpisodeChunk(
+            start_latent=1,
+            latent=torch.zeros(1, 2, 1, 1),
+            action=torch.zeros(8, 2, 1, 1),
+            mask=torch.ones(8, 2, 1, 1, dtype=torch.bool),
+        )
+    ]
+    config = SimpleNamespace(
+        relative_pose_groups=(
+            {"pose_slice": (0, 7), "gripper_slice": (7, 8)},
+        ),
+        quaternion_order="wxyz",
+        relative_pose_frame="local_frame",
+    )
+
+    absolute_prediction, absolute_target = reconstruct_absolute_episode_actions(
+        relative_prediction,
+        sample,
+        chunks,
+        config,
+    )
+
+    np.testing.assert_allclose(absolute_prediction, absolute_target, atol=1e-6)
+    np.testing.assert_allclose(absolute_target[:, :3], raw_actions[1:, 0, :3], atol=1e-6)
 
 
 def test_deployment_native_first_chunk_masks_only_condition_action_latent() -> None:
