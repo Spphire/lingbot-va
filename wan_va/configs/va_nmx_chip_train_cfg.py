@@ -72,6 +72,7 @@ va_nmx_chip_train_cfg.expected_latent_channels = 48
 va_nmx_chip_train_cfg.action_dim = 30
 va_nmx_chip_train_cfg.action_per_frame = 12
 va_nmx_chip_train_cfg.actions_per_frame = 1
+va_nmx_chip_train_cfg.action_condition_mode = "inverse_dynamics"
 
 va_nmx_chip_train_cfg.action_contract = "nmx_chunk_relative_v10"
 va_nmx_chip_train_cfg.action_chunk_size_min = 1
@@ -143,3 +144,20 @@ va_nmx_chip_train_per_view_pad_cfg.__name__ = (
 va_nmx_chip_train_per_view_pad_cfg.visual_contract = (
     "per_view_zero_pad_then_concat_v1"
 )
+
+
+# FastWAM keeps the original shared LingBot-VA backbone and changes only the
+# action-conditioning attention contract. The A/B pair remains visual-only.
+va_nmx_chip_train_fastwam_cfg = deepcopy(va_nmx_chip_train_cfg)
+va_nmx_chip_train_fastwam_cfg.__name__ = (
+    "Config: NMX chip train, FastWAM action conditioning"
+)
+va_nmx_chip_train_fastwam_cfg.action_condition_mode = "fastwam"
+
+va_nmx_chip_train_per_view_pad_fastwam_cfg = deepcopy(
+    va_nmx_chip_train_per_view_pad_cfg
+)
+va_nmx_chip_train_per_view_pad_fastwam_cfg.__name__ = (
+    "Config: NMX chip train, per-view padding, FastWAM action conditioning"
+)
+va_nmx_chip_train_per_view_pad_fastwam_cfg.action_condition_mode = "fastwam"
