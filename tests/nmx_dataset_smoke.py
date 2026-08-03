@@ -15,7 +15,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--dataset-root",
-        default="/mnt/workspace/shenyibo/datasets/chip_0709_1952episodes",
+        default=None,
+        help="Override the selected config's dataset root",
     )
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--all-recorded", action="store_true")
@@ -31,7 +32,7 @@ def main():
     args = parser.parse_args()
 
     config = deepcopy(VA_CONFIGS[args.config_name])
-    if not args.all_recorded:
+    if not args.all_recorded and args.dataset_root is not None:
         config.dataset_path = args.dataset_root
     config.cfg_prob = 0.0
     dataset = MultiLatentLeRobotDataset(config=config, num_init_worker=1)
