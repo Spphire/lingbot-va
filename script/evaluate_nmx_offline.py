@@ -304,6 +304,36 @@ def split_episode_chunks(
     return condition_latent, condition_action, chunks
 
 
+def deployment_native_first_chunk_target(
+    sample: dict[str, torch.Tensor],
+    *,
+    frame_chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return the frame-zero server input and its aligned action target."""
+
+    latents = torch.as_tensor(sample["latents"])
+    actions = torch.as_tensor(sample["actions"])
+    masks = torch.as_tensor(sample["actions_mask"]).clone()
+    if latents.ndim != 4:
+        raise ValueError(f"Expected latents [C,F,H,W], got {tuple(latents.shape)}")
+    if actions.ndim != 4 or masks.shape != actions.shape:
+        raise ValueError(
+            "Expected matching actions/actions_mask [C,F,N,1], got "
+            f"{tuple(actions.shape)} and {tuple(masks.shape)}"
+        )
+    if int(latents.shape[1]) < frame_chunk_size:
+        raise ValueError(
+            f"Sample has {latents.shape[1]} latent frames, fewer than "
+            f"frame_chunk_size={frame_chunk_size}"
+        )
+    masks[:, :1] = False
+    return (
+        latents[:, :1].contiguous(),
+        actions[:, :frame_chunk_size].contiguous(),
+        masks[:, :frame_chunk_size].contiguous(),
+    )
+
+
 def denormalize_training_action(
     normalized: torch.Tensor,
     mask: torch.Tensor,
@@ -483,6 +513,14 @@ def main() -> None:
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--num-init-worker", type=int, default=1)
     parser.add_argument(
+        "--evaluation-mode",
+        choices=(
+            "deployment_native_first_chunk",
+            "teacher_forced_video_full_episode",
+        ),
+        default="deployment_native_first_chunk",
+    )
+    parser.add_argument(
         "--max-chunks",
         type=int,
         help="Limit chunks per episode for a smoke test; default evaluates the full sample",
@@ -553,21 +591,41 @@ def main() -> None:
         if explicit_indices is None and episode_key in selected_episodes:
             continue
         sample = dataset[sample_index]
-        condition_latent, condition_action, chunks = split_episode_chunks(
-            sample,
-            frame_chunk_size=int(config.frame_chunk_size),
-            grouping_start_from_one=bool(config.chunk_grouping_start_from_one),
-            max_chunks=args.max_chunks,
-        )
         used_ids = [int(value) for value in config.used_action_channel_ids]
         q01 = torch.as_tensor(sample["action_q01"]).float()
         q99 = torch.as_tensor(sample["action_q99"]).float()
         lower_bounds, upper_bounds = physical_action_bounds(q01, q99, used_ids)
-        chunk_targets = [
-            denormalize_training_action(chunk.action, chunk.mask, q01, q99, used_ids)
-            for chunk in chunks
-        ]
-        if not chunks or not any(has_valid_evaluation_target(mask) for _, mask in chunk_targets):
+        if args.evaluation_mode == "deployment_native_first_chunk":
+            condition_latent, target_action, target_mask = (
+                deployment_native_first_chunk_target(
+                    sample,
+                    frame_chunk_size=int(config.frame_chunk_size),
+                )
+            )
+            chunk_targets = [
+                denormalize_training_action(
+                    target_action,
+                    target_mask,
+                    q01,
+                    q99,
+                    used_ids,
+                )
+            ]
+            chunks = []
+        else:
+            condition_latent, condition_action, chunks = split_episode_chunks(
+                sample,
+                frame_chunk_size=int(config.frame_chunk_size),
+                grouping_start_from_one=bool(config.chunk_grouping_start_from_one),
+                max_chunks=args.max_chunks,
+            )
+            chunk_targets = [
+                denormalize_training_action(chunk.action, chunk.mask, q01, q99, used_ids)
+                for chunk in chunks
+            ]
+        if not chunk_targets or not any(
+            has_valid_evaluation_target(mask) for _, mask in chunk_targets
+        ):
             if explicit_indices is not None:
                 raise ValueError(
                     f"Sample index {sample_index} has no valid action targets in the "
@@ -584,42 +642,60 @@ def main() -> None:
         server.prompt_embeds = _as_embedding(sample["text_emb"], server.device, server.dtype)
         server.negative_prompt_embeds = _as_embedding(empty_embedding, server.device, server.dtype)
         server.set_action_norm_stats(q01, q99)
-        server.cache_training_context(condition_latent, condition_action)
 
         predictions: list[np.ndarray] = []
         targets: list[np.ndarray] = []
         masks: list[np.ndarray] = []
         chunk_boundaries: list[int] = []
-        for chunk_index, (chunk, (chunk_target, chunk_mask)) in enumerate(
-            zip(chunks, chunk_targets, strict=True)
-        ):
-            if server.frame_st_id != chunk.start_latent:
-                raise RuntimeError(
-                    "KV-cache timeline drifted before chunk "
-                    f"{chunk_index}: {server.frame_st_id} != {chunk.start_latent}"
-                )
-            torch.manual_seed(args.seed + ordinal * 100_000 + chunk_index)
-            action, _latents = server._infer({}, frame_st_id=server.frame_st_id)
+        if args.evaluation_mode == "deployment_native_first_chunk":
+            torch.manual_seed(args.seed + ordinal * 100_000)
+            action, _latents = server._infer(
+                {"video_latent": condition_latent},
+                frame_st_id=0,
+            )
             chunk_prediction = flatten_server_action(np.asarray(action))
-            expected_steps = int(chunk.action.shape[1] * chunk.action.shape[2])
-            chunk_prediction = chunk_prediction[:expected_steps]
+            chunk_target, chunk_mask = chunk_targets[0]
             if chunk_prediction.shape != chunk_target.shape:
                 raise ValueError(
-                    "Prediction/target shape mismatch in chunk "
-                    f"{chunk_index}: {chunk_prediction.shape} != {chunk_target.shape}"
+                    "Deployment-native prediction/target shape mismatch: "
+                    f"{chunk_prediction.shape} != {chunk_target.shape}"
                 )
             predictions.append(chunk_prediction)
             targets.append(chunk_target)
             masks.append(chunk_mask)
-            chunk_boundaries.append(sum(value.shape[0] for value in predictions))
+            chunk_boundaries.append(int(chunk_prediction.shape[0]))
+        else:
+            server.cache_training_context(condition_latent, condition_action)
+            for chunk_index, (chunk, (chunk_target, chunk_mask)) in enumerate(
+                zip(chunks, chunk_targets, strict=True)
+            ):
+                if server.frame_st_id != chunk.start_latent:
+                    raise RuntimeError(
+                        "KV-cache timeline drifted before chunk "
+                        f"{chunk_index}: {server.frame_st_id} != {chunk.start_latent}"
+                    )
+                torch.manual_seed(args.seed + ordinal * 100_000 + chunk_index)
+                action, _latents = server._infer({}, frame_st_id=server.frame_st_id)
+                chunk_prediction = flatten_server_action(np.asarray(action))
+                expected_steps = int(chunk.action.shape[1] * chunk.action.shape[2])
+                chunk_prediction = chunk_prediction[:expected_steps]
+                if chunk_prediction.shape != chunk_target.shape:
+                    raise ValueError(
+                        "Prediction/target shape mismatch in chunk "
+                        f"{chunk_index}: {chunk_prediction.shape} != {chunk_target.shape}"
+                    )
+                predictions.append(chunk_prediction)
+                targets.append(chunk_target)
+                masks.append(chunk_mask)
+                chunk_boundaries.append(sum(value.shape[0] for value in predictions))
 
-            if chunk_index + 1 < len(chunks):
-                history_action = (
-                    torch.zeros_like(chunk.action)
-                    if action_history_mode == "zero"
-                    else chunk.action
-                )
-                server.cache_training_context(chunk.latent, history_action)
+                if chunk_index + 1 < len(chunks):
+                    history_action = (
+                        torch.zeros_like(chunk.action)
+                        if action_history_mode == "zero"
+                        else chunk.action
+                    )
+                    server.cache_training_context(chunk.latent, history_action)
 
         prediction = np.concatenate(predictions)
         target = np.concatenate(targets)
@@ -651,14 +727,20 @@ def main() -> None:
         records.append(
             {
                 "sample": metadata,
-                "mode": "teacher_forced_video_full_episode",
+                "mode": args.evaluation_mode,
                 "action_history_mode": action_history_mode,
                 "total_latent_frames": int(sample["latents"].shape[1]),
                 "condition_latent_frames": 1,
-                "predicted_latent_frames": int(
-                    sum(chunk.latent.shape[1] for chunk in chunks)
+                "predicted_latent_frames": (
+                    int(config.frame_chunk_size) - 1
+                    if args.evaluation_mode == "deployment_native_first_chunk"
+                    else int(sum(chunk.latent.shape[1] for chunk in chunks))
                 ),
-                "chunks": len(chunks),
+                "chunks": (
+                    1
+                    if args.evaluation_mode == "deployment_native_first_chunk"
+                    else len(chunks)
+                ),
                 "predicted_action_steps": int(prediction.shape[0]),
                 "valid_action_steps": int(np.count_nonzero(valid_steps)),
                 "covered_seconds": float(prediction.shape[0] / config.control_fps),
@@ -691,7 +773,7 @@ def main() -> None:
         "transformer": str(transformer_path),
         "config_name": args.config_name,
         "visual_contract": str(config.visual_contract),
-        "evaluation_mode": "teacher_forced_video_full_episode",
+        "evaluation_mode": args.evaluation_mode,
         "action_history_mode": action_history_mode,
         "chunk_grouping_start_from_one": bool(config.chunk_grouping_start_from_one),
         "max_chunks": args.max_chunks,

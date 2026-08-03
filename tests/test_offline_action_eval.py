@@ -9,6 +9,7 @@ import torch
 from script.evaluate_nmx_offline import (
     compute_metrics,
     denormalize_training_action,
+    deployment_native_first_chunk_target,
     flatten_server_action,
     has_valid_evaluation_target,
     physical_action_bounds,
@@ -76,6 +77,24 @@ def test_split_episode_chunks_excludes_condition_once_and_keeps_tail() -> None:
         frame_chunk_size=4,
         grouping_start_from_one=True,
     )
+
+
+def test_deployment_native_first_chunk_masks_only_condition_action_latent() -> None:
+    sample = {
+        "latents": torch.arange(10).reshape(1, 10, 1, 1),
+        "actions": torch.arange(120).reshape(1, 10, 12, 1).float(),
+        "actions_mask": torch.ones(1, 10, 12, 1, dtype=torch.bool),
+    }
+
+    condition, target, mask = deployment_native_first_chunk_target(
+        sample,
+        frame_chunk_size=4,
+    )
+
+    assert condition.flatten().tolist() == [0]
+    assert target.shape == (1, 4, 12, 1)
+    assert not mask[:, 0].any()
+    assert mask[:, 1:].all()
 
     assert condition_latent.flatten().tolist() == [0]
     assert condition_action.flatten().tolist() == [0]
