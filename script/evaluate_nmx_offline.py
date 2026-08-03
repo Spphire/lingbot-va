@@ -206,6 +206,14 @@ class EpisodeChunk:
     mask: torch.Tensor
 
 
+@dataclass(frozen=True)
+class DeploymentNativeWindow:
+    start_latent: int
+    condition_latent: torch.Tensor
+    action: torch.Tensor
+    mask: torch.Tensor
+
+
 def _checkpoint_transformer(path: Path) -> Path:
     path = path.expanduser().resolve()
     transformer = path if path.name == "transformer" else path / "transformer"
@@ -332,6 +340,49 @@ def deployment_native_first_chunk_target(
         actions[:, :frame_chunk_size].contiguous(),
         masks[:, :frame_chunk_size].contiguous(),
     )
+
+
+def split_deployment_native_windows(
+    sample: dict[str, torch.Tensor],
+    *,
+    frame_chunk_size: int,
+) -> list[DeploymentNativeWindow]:
+    """Cover an episode with frame-zero inference windows and no target overlap."""
+
+    if frame_chunk_size <= 1:
+        raise ValueError(
+            "deployment-native episode windows require frame_chunk_size greater than 1"
+        )
+    latents = torch.as_tensor(sample["latents"])
+    actions = torch.as_tensor(sample["actions"])
+    masks = torch.as_tensor(sample["actions_mask"])
+    if latents.ndim != 4:
+        raise ValueError(f"Expected latents [C,F,H,W], got {tuple(latents.shape)}")
+    if actions.ndim != 4 or masks.shape != actions.shape:
+        raise ValueError(
+            "Expected matching actions/actions_mask [C,F,N,1], got "
+            f"{tuple(actions.shape)} and {tuple(masks.shape)}"
+        )
+    if int(latents.shape[1]) != int(actions.shape[1]):
+        raise ValueError(
+            f"Latent/action frame counts differ: {latents.shape[1]} != {actions.shape[1]}"
+        )
+
+    stride = frame_chunk_size - 1
+    windows: list[DeploymentNativeWindow] = []
+    for start in range(0, int(latents.shape[1]) - 1, stride):
+        end = min(start + frame_chunk_size, int(latents.shape[1]))
+        window_mask = masks[:, start:end].clone()
+        window_mask[:, :1] = False
+        windows.append(
+            DeploymentNativeWindow(
+                start_latent=start,
+                condition_latent=latents[:, start : start + 1].contiguous(),
+                action=actions[:, start:end].contiguous(),
+                mask=window_mask.contiguous(),
+            )
+        )
+    return windows
 
 
 def denormalize_training_action(
@@ -516,6 +567,7 @@ def main() -> None:
         "--evaluation-mode",
         choices=(
             "deployment_native_first_chunk",
+            "deployment_native_teacher_forced_episode",
             "teacher_forced_video_full_episode",
         ),
         default="deployment_native_first_chunk",
@@ -591,11 +643,16 @@ def main() -> None:
         if explicit_indices is None and episode_key in selected_episodes:
             continue
         sample = dataset[sample_index]
+        total_latent_frames = int(sample["latents"].shape[1])
         used_ids = [int(value) for value in config.used_action_channel_ids]
         q01 = torch.as_tensor(sample["action_q01"]).float()
         q99 = torch.as_tensor(sample["action_q99"]).float()
         lower_bounds, upper_bounds = physical_action_bounds(q01, q99, used_ids)
-        if args.evaluation_mode == "deployment_native_first_chunk":
+        native_first_chunk = args.evaluation_mode == "deployment_native_first_chunk"
+        native_episode = (
+            args.evaluation_mode == "deployment_native_teacher_forced_episode"
+        )
+        if native_first_chunk:
             condition_latent, target_action, target_mask = (
                 deployment_native_first_chunk_target(
                     sample,
@@ -612,6 +669,23 @@ def main() -> None:
                 )
             ]
             chunks = []
+            native_windows = []
+        elif native_episode:
+            native_windows = split_deployment_native_windows(
+                sample,
+                frame_chunk_size=int(config.frame_chunk_size),
+            )
+            chunk_targets = [
+                denormalize_training_action(
+                    window.action,
+                    window.mask,
+                    q01,
+                    q99,
+                    used_ids,
+                )
+                for window in native_windows
+            ]
+            chunks = []
         else:
             condition_latent, condition_action, chunks = split_episode_chunks(
                 sample,
@@ -623,6 +697,7 @@ def main() -> None:
                 denormalize_training_action(chunk.action, chunk.mask, q01, q99, used_ids)
                 for chunk in chunks
             ]
+            native_windows = []
         if not chunk_targets or not any(
             has_valid_evaluation_target(mask) for _, mask in chunk_targets
         ):
@@ -637,17 +712,29 @@ def main() -> None:
             selected_episodes.add(episode_key)
 
         ordinal = len(records)
-        server.set_episode_latent_shape(sample["latents"])
-        server._reset(prompt=None)
-        server.prompt_embeds = _as_embedding(sample["text_emb"], server.device, server.dtype)
-        server.negative_prompt_embeds = _as_embedding(empty_embedding, server.device, server.dtype)
-        server.set_action_norm_stats(q01, q99)
+
+        def reset_server() -> None:
+            server.set_episode_latent_shape(sample["latents"])
+            server._reset(prompt=None)
+            server.prompt_embeds = _as_embedding(
+                sample["text_emb"],
+                server.device,
+                server.dtype,
+            )
+            server.negative_prompt_embeds = _as_embedding(
+                empty_embedding,
+                server.device,
+                server.dtype,
+            )
+            server.set_action_norm_stats(q01, q99)
+
+        reset_server()
 
         predictions: list[np.ndarray] = []
         targets: list[np.ndarray] = []
         masks: list[np.ndarray] = []
         chunk_boundaries: list[int] = []
-        if args.evaluation_mode == "deployment_native_first_chunk":
+        if native_first_chunk:
             torch.manual_seed(args.seed + ordinal * 100_000)
             action, _latents = server._infer(
                 {"video_latent": condition_latent},
@@ -664,6 +751,31 @@ def main() -> None:
             targets.append(chunk_target)
             masks.append(chunk_mask)
             chunk_boundaries.append(int(chunk_prediction.shape[0]))
+        elif native_episode:
+            condition_steps = int(config.action_per_frame)
+            for window_index, (window, (window_target, window_mask)) in enumerate(
+                zip(native_windows, chunk_targets, strict=True)
+            ):
+                if window_index > 0:
+                    reset_server()
+                torch.manual_seed(args.seed + ordinal * 100_000 + window_index)
+                action, _latents = server._infer(
+                    {"video_latent": window.condition_latent},
+                    frame_st_id=0,
+                )
+                window_prediction = flatten_server_action(np.asarray(action))
+                expected_steps = int(window.action.shape[1] * window.action.shape[2])
+                window_prediction = window_prediction[:expected_steps]
+                if window_prediction.shape != window_target.shape:
+                    raise ValueError(
+                        "Deployment-native window prediction/target shape mismatch at "
+                        f"latent {window.start_latent}: "
+                        f"{window_prediction.shape} != {window_target.shape}"
+                    )
+                predictions.append(window_prediction[condition_steps:])
+                targets.append(window_target[condition_steps:])
+                masks.append(window_mask[condition_steps:])
+                chunk_boundaries.append(sum(value.shape[0] for value in predictions))
         else:
             server.cache_training_context(condition_latent, condition_action)
             for chunk_index, (chunk, (chunk_target, chunk_mask)) in enumerate(
@@ -724,23 +836,31 @@ def main() -> None:
             chunk_boundaries,
         )
         valid_steps = np.any(mask, axis=1)
+        if native_first_chunk:
+            condition_latent_frames = 1
+            predicted_latent_frames = int(config.frame_chunk_size) - 1
+            chunk_count = 1
+        elif native_episode:
+            condition_latent_frames = len(native_windows)
+            predicted_latent_frames = sum(
+                int(window.action.shape[1]) - 1 for window in native_windows
+            )
+            chunk_count = len(native_windows)
+        else:
+            condition_latent_frames = 1
+            predicted_latent_frames = int(
+                sum(chunk.latent.shape[1] for chunk in chunks)
+            )
+            chunk_count = len(chunks)
         records.append(
             {
                 "sample": metadata,
                 "mode": args.evaluation_mode,
                 "action_history_mode": action_history_mode,
-                "total_latent_frames": int(sample["latents"].shape[1]),
-                "condition_latent_frames": 1,
-                "predicted_latent_frames": (
-                    int(config.frame_chunk_size) - 1
-                    if args.evaluation_mode == "deployment_native_first_chunk"
-                    else int(sum(chunk.latent.shape[1] for chunk in chunks))
-                ),
-                "chunks": (
-                    1
-                    if args.evaluation_mode == "deployment_native_first_chunk"
-                    else len(chunks)
-                ),
+                "total_latent_frames": total_latent_frames,
+                "condition_latent_frames": condition_latent_frames,
+                "predicted_latent_frames": predicted_latent_frames,
+                "chunks": chunk_count,
                 "predicted_action_steps": int(prediction.shape[0]),
                 "valid_action_steps": int(np.count_nonzero(valid_steps)),
                 "covered_seconds": float(prediction.shape[0] / config.control_fps),
@@ -781,7 +901,9 @@ def main() -> None:
         "seed": int(args.seed),
         "evaluated_episodes": len(records),
         "skipped_episodes_without_valid_targets": skipped_without_targets,
-        "condition_action_steps_excluded_once_per_episode": int(config.action_per_frame),
+        "condition_action_steps_excluded_per_inference_window": int(
+            config.action_per_frame
+        ),
         "control_fps": float(config.control_fps),
         "plot_scale": "denormalized_physical_units",
         "plot_y_limits": "per_channel_q01_q99",

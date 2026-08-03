@@ -14,6 +14,7 @@ from script.evaluate_nmx_offline import (
     has_valid_evaluation_target,
     physical_action_bounds,
     resolve_action_history_mode,
+    split_deployment_native_windows,
     split_episode_chunks,
 )
 
@@ -103,6 +104,23 @@ def test_deployment_native_first_chunk_masks_only_condition_action_latent() -> N
     assert target.shape == (1, 4, 12, 1)
     assert not mask[:, 0].any()
     assert mask[:, 1:].all()
+
+
+def test_deployment_native_windows_cover_every_post_condition_latent_once() -> None:
+    sample = {
+        "latents": torch.arange(10).reshape(1, 10, 1, 1),
+        "actions": torch.arange(120).reshape(1, 10, 12, 1).float(),
+        "actions_mask": torch.ones(1, 10, 12, 1, dtype=torch.bool),
+    }
+
+    windows = split_deployment_native_windows(sample, frame_chunk_size=4)
+
+    assert [window.start_latent for window in windows] == [0, 3, 6]
+    assert [window.action.shape[1] for window in windows] == [4, 4, 4]
+    covered = torch.cat([window.action[:, 1:] for window in windows], dim=1)
+    torch.testing.assert_close(covered, sample["actions"][:, 1:])
+    assert all(not window.mask[:, 0].any() for window in windows)
+    assert all(window.mask[:, 1:].all() for window in windows)
 
 
 def test_denormalize_action_and_plot_bounds_use_physical_channel_scale() -> None:
