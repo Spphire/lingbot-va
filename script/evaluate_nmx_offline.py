@@ -19,7 +19,10 @@ import torch
 
 from wan_va.configs import VA_CONFIGS
 from wan_va.dataset.lerobot_latent_dataset import MultiLatentLeRobotDataset
-from wan_va.dataset.nmx_action_adapter import load_action_norm_stats
+from wan_va.dataset.nmx_action_adapter import (
+    build_model_actions_from_raw,
+    load_action_norm_stats,
+)
 from wan_va.distributed.fsdp import shard_model
 from wan_va.distributed.util import _configure_model
 from wan_va.modules.utils import load_transformer
@@ -312,6 +315,49 @@ def split_episode_chunks(
     return condition_latent, condition_action, chunks
 
 
+def rebuild_sample_actions_for_chunk_size(
+    sample: dict[str, torch.Tensor],
+    config: Any,
+    frame_chunk_size: int,
+) -> dict[str, torch.Tensor]:
+    """Rebuild relative-action targets with the same sampled K used in training."""
+
+    if frame_chunk_size <= 0:
+        raise ValueError(f"frame_chunk_size must be positive, got {frame_chunk_size}")
+    required = (
+        "raw_actions",
+        "raw_states",
+        "raw_actions_step_mask",
+        "action_q01",
+        "action_q99",
+        "actions_mask",
+    )
+    missing = [key for key in required if key not in sample]
+    if missing:
+        raise KeyError(f"Cannot rebuild evaluation actions; missing sample keys: {missing}")
+
+    actions, masks = build_model_actions_from_raw(
+        torch.as_tensor(sample["raw_actions"]),
+        torch.as_tensor(sample["raw_states"]),
+        torch.as_tensor(sample["raw_actions_step_mask"]),
+        config,
+        q01=torch.as_tensor(sample["action_q01"]),
+        q99=torch.as_tensor(sample["action_q99"]),
+        chunk_size_frames=int(frame_chunk_size),
+    )
+    dataset_mask = torch.as_tensor(sample["actions_mask"]).bool()
+    if masks.shape != dataset_mask.shape:
+        raise ValueError(
+            f"Rebuilt action mask {tuple(masks.shape)} does not match dataset mask "
+            f"{tuple(dataset_mask.shape)}"
+        )
+    masks = masks & dataset_mask
+    rebuilt = dict(sample)
+    rebuilt["actions"] = actions * masks.to(dtype=actions.dtype)
+    rebuilt["actions_mask"] = masks
+    return rebuilt
+
+
 def deployment_native_first_chunk_target(
     sample: dict[str, torch.Tensor],
     *,
@@ -564,13 +610,19 @@ def main() -> None:
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--num-init-worker", type=int, default=1)
     parser.add_argument(
+        "--frame-chunk-size",
+        type=int,
+        choices=(1, 2, 3, 4),
+        help="Override inference K and rebuild relative-action targets using the same K",
+    )
+    parser.add_argument(
         "--evaluation-mode",
         choices=(
             "deployment_native_first_chunk",
             "deployment_native_teacher_forced_episode",
             "teacher_forced_video_full_episode",
         ),
-        default="deployment_native_first_chunk",
+        default="teacher_forced_video_full_episode",
     )
     parser.add_argument(
         "--max-chunks",
@@ -598,6 +650,8 @@ def main() -> None:
     config.attn_mode = "torch"
     config.cfg_prob = 0.0
     config.max_latent_frames = None
+    if args.frame_chunk_size is not None:
+        config.frame_chunk_size = int(args.frame_chunk_size)
     config.save_root = str(args.output_dir.expanduser().resolve())
     config.norm_stat = load_action_norm_stats(config.dataset_path[0], config)
     action_history_mode = resolve_action_history_mode(config, args.action_history_mode)
@@ -642,7 +696,11 @@ def main() -> None:
         )
         if explicit_indices is None and episode_key in selected_episodes:
             continue
-        sample = dataset[sample_index]
+        sample = rebuild_sample_actions_for_chunk_size(
+            dataset[sample_index],
+            config,
+            int(config.frame_chunk_size),
+        )
         total_latent_frames = int(sample["latents"].shape[1])
         used_ids = [int(value) for value in config.used_action_channel_ids]
         q01 = torch.as_tensor(sample["action_q01"]).float()
@@ -896,6 +954,7 @@ def main() -> None:
         "evaluation_mode": args.evaluation_mode,
         "action_history_mode": action_history_mode,
         "chunk_grouping_start_from_one": bool(config.chunk_grouping_start_from_one),
+        "frame_chunk_size": int(config.frame_chunk_size),
         "max_chunks": args.max_chunks,
         "dataset_roots": list(config.dataset_path),
         "seed": int(args.seed),

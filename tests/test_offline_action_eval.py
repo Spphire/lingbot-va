@@ -13,6 +13,7 @@ from script.evaluate_nmx_offline import (
     flatten_server_action,
     has_valid_evaluation_target,
     physical_action_bounds,
+    rebuild_sample_actions_for_chunk_size,
     resolve_action_history_mode,
     split_deployment_native_windows,
     split_episode_chunks,
@@ -86,6 +87,74 @@ def test_split_episode_chunks_excludes_condition_once_and_keeps_tail() -> None:
     assert torch.cat([chunk.latent for chunk in chunks], dim=1).flatten().tolist() == list(
         range(1, 10)
     )
+
+
+@pytest.mark.parametrize(
+    ("chunk_size", "starts", "lengths"),
+    (
+        (1, [1, 2, 3, 4, 5, 6, 7, 8, 9], [1] * 9),
+        (2, [1, 3, 5, 7, 9], [2, 2, 2, 2, 1]),
+        (3, [1, 4, 7], [3, 3, 3]),
+        (4, [1, 5, 9], [4, 4, 1]),
+    ),
+)
+def test_training_aligned_chunks_support_all_trained_sizes(
+    chunk_size: int,
+    starts: list[int],
+    lengths: list[int],
+) -> None:
+    sample = {
+        "latents": torch.arange(10).reshape(1, 10, 1, 1),
+        "actions": torch.arange(10).reshape(1, 10, 1, 1).float(),
+        "actions_mask": torch.ones(1, 10, 1, 1, dtype=torch.bool),
+    }
+
+    _, _, chunks = split_episode_chunks(
+        sample,
+        frame_chunk_size=chunk_size,
+        grouping_start_from_one=True,
+    )
+
+    assert [chunk.start_latent for chunk in chunks] == starts
+    assert [chunk.latent.shape[1] for chunk in chunks] == lengths
+    assert torch.cat([chunk.latent for chunk in chunks], dim=1).flatten().tolist() == list(
+        range(1, 10)
+    )
+
+
+def test_rebuild_sample_actions_uses_requested_chunk_anchor() -> None:
+    config = SimpleNamespace(
+        relative_pose_groups=(
+            {"pose_slice": (0, 7), "gripper_slice": (7, 8)},
+        ),
+        quaternion_order="xyzw",
+        relative_pose_frame="world_frame",
+        chunk_grouping_start_from_one=True,
+        used_action_channel_ids=tuple(range(8)),
+        action_dim=8,
+    )
+    raw_actions = torch.zeros(5, 1, 8)
+    raw_states = torch.zeros_like(raw_actions)
+    raw_actions[:, 0, 0] = torch.arange(5).float()
+    raw_states[:, 0, 0] = torch.arange(5).float()
+    raw_actions[:, 0, 6] = 1.0
+    raw_states[:, 0, 6] = 1.0
+    sample = {
+        "raw_actions": raw_actions,
+        "raw_states": raw_states,
+        "raw_actions_step_mask": torch.ones(5, 1, dtype=torch.bool),
+        "action_q01": torch.full((8,), -10.0),
+        "action_q99": torch.full((8,), 10.0),
+        "actions": torch.zeros(8, 5, 1, 1),
+        "actions_mask": torch.ones(8, 5, 1, 1, dtype=torch.bool),
+    }
+
+    rebuilt_k2 = rebuild_sample_actions_for_chunk_size(sample, config, 2)
+    rebuilt_k4 = rebuild_sample_actions_for_chunk_size(sample, config, 4)
+
+    # Frame 3 starts a new K=2 chunk but remains inside the first K=4 chunk.
+    assert rebuilt_k2["actions"][0, 3, 0, 0].item() == pytest.approx(0.0)
+    assert rebuilt_k4["actions"][0, 3, 0, 0].item() == pytest.approx(0.2)
 
 
 def test_deployment_native_first_chunk_masks_only_condition_action_latent() -> None:
