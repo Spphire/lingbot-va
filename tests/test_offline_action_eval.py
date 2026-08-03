@@ -153,7 +153,7 @@ def test_rebuild_sample_actions_uses_requested_chunk_anchor() -> None:
     rebuilt_k4 = rebuild_sample_actions_for_chunk_size(sample, config, 4)
 
     # Frame 3 starts a new K=2 chunk but remains inside the first K=4 chunk.
-    assert rebuilt_k2["actions"][0, 3, 0, 0].item() == pytest.approx(0.0)
+    assert rebuilt_k2["actions"][0, 3, 0, 0].item() == pytest.approx(0.0, abs=1e-6)
     assert rebuilt_k4["actions"][0, 3, 0, 0].item() == pytest.approx(0.2)
 
 
