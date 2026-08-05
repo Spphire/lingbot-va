@@ -208,6 +208,11 @@ def test_fastwam_visual_ab_configs_change_only_action_mode_and_visual_contract()
     assert fastwam_padded.action_condition_mode == "fastwam"
     assert idm_baseline.action_norm_method == "quantiles"
     assert fastwam_baseline.action_norm_method == idm_baseline.action_norm_method
+    assert idm_baseline.raw_image_hw == [360, 640]
+    assert idm_baseline.crop_before_resize == [185, 185, 0, 0]
+    assert idm_baseline.crop_resize_size == [320, 240]
+    assert idm_baseline.control_chunk_length == 48
+    assert idm_baseline.control_fps == 30.0
     assert fastwam_baseline.visual_contract == UPSTREAM_SINGLE_CANVAS_VISUAL_CONTRACT
     assert fastwam_padded.visual_contract == PER_VIEW_ZERO_PAD_VISUAL_CONTRACT
 

@@ -107,6 +107,26 @@ va_nmx_chip_train_cfg.action_norm_stats_version = (
     "chunk_relative_v10_velocity_symmetric_scale"
 )
 va_nmx_chip_train_cfg.action_norm_method = "quantiles"
+va_nmx_chip_train_cfg.action_quaternion_order = "xyzw"
+va_nmx_chip_train_cfg.action_history_adds_parameters = False
+
+# Persist the raw-camera and streaming contract used by the training runs so
+# deployment and offline evaluation can reproduce the same model inputs.
+va_nmx_chip_train_cfg.raw_image_hw = [360, 640]
+va_nmx_chip_train_cfg.reshape_mode = "crop_resize"
+va_nmx_chip_train_cfg.center_crop_before_resize = False
+va_nmx_chip_train_cfg.crop_before_resize = [185, 185, 0, 0]
+va_nmx_chip_train_cfg.crop_resize_size = [320, 240]
+va_nmx_chip_train_cfg.pad_after_resize = None
+va_nmx_chip_train_cfg.camera_rotation_degrees = [0, 0]
+va_nmx_chip_train_cfg.control_action_dim = 16
+va_nmx_chip_train_cfg.control_chunk_length = 48
+va_nmx_chip_train_cfg.source_action_per_frame = 1
+va_nmx_chip_train_cfg.source_video_frame_stride = 3
+va_nmx_chip_train_cfg.video_frames_per_latent = 4
+va_nmx_chip_train_cfg.sampled_video_fps = 10.0
+va_nmx_chip_train_cfg.control_fps = 30.0
+va_nmx_chip_train_cfg.first_prediction_skip_action_latents = 1
 
 va_nmx_chip_train_cfg.attn_window = 3
 va_nmx_chip_train_cfg.frame_chunk_size = 4
