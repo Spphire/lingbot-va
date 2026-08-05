@@ -106,6 +106,7 @@ va_nmx_chip_train_cfg.action_norm_stats_filename = "lingbot_action_norm_stats.js
 va_nmx_chip_train_cfg.action_norm_stats_version = (
     "chunk_relative_v10_velocity_symmetric_scale"
 )
+va_nmx_chip_train_cfg.action_norm_method = "quantiles"
 
 va_nmx_chip_train_cfg.attn_window = 3
 va_nmx_chip_train_cfg.frame_chunk_size = 4

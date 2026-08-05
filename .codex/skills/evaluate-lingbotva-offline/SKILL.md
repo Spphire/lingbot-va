@@ -29,7 +29,8 @@ before choosing a checkpoint, config, dataset sample, or comparison metric.
 ## Invocation
 
 ```bash
-CUDA_VISIBLE_DEVICES=<PHYSICAL_GPU> <PYTHON> script/evaluate_nmx_offline.py \
+PYTHONPATH=. CUDA_VISIBLE_DEVICES=<PHYSICAL_GPU> \
+  <PYTHON> script/evaluate_nmx_offline.py \
   --checkpoint <CHECKPOINT_STEP_DIR> \
   --base-model <LINGBOT_VA_BASE> \
   --dataset-root <LEROBOT_DATASET> \
@@ -64,4 +65,3 @@ Require all of the following:
 
 Do not call a checkpoint better solely because it is faster. Report action-quality
 metrics, trajectory plots, and latency together.
-
