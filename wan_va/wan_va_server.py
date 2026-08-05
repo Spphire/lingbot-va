@@ -36,6 +36,7 @@ from utils import (
     run_async_server_mode,
     save_async,
 )
+from inference_modes import resolve_video_run_mode
 
 
 class VA_Server:
@@ -442,17 +443,35 @@ class VA_Server:
 
     def _infer(self, obs, frame_st_id=0):
         frame_chunk_size = self.job_config.frame_chunk_size
-        if frame_st_id == 0:
+        action_condition_mode = str(
+            getattr(self.job_config, "action_condition_mode", "inverse_dynamics")
+        )
+        fastwam_video_run_mode = getattr(
+            self.job_config, "fastwam_video_run_mode", False
+        )
+        video_run_mode = resolve_video_run_mode(
+            action_condition_mode,
+            fastwam_video_run_mode,
+        )
+        if not video_run_mode and frame_st_id == 0:
+            raise RuntimeError(
+                "FastWAM action-only inference requires the real initial condition "
+                "to be committed to the KV cache before predicting a chunk"
+            )
+
+        if video_run_mode and frame_st_id == 0:
             init_latent = self._encode_obs(obs)
             self.init_latent = init_latent
 
-        latents = torch.randn(1,
-                              48,
-                              frame_chunk_size,
-                              self.latent_height,
-                              self.latent_width,
-                              device=self.device,
-                              dtype=self.dtype)
+        latents = None
+        if video_run_mode:
+            latents = torch.randn(1,
+                                  48,
+                                  frame_chunk_size,
+                                  self.latent_height,
+                                  self.latent_width,
+                                  device=self.device,
+                                  dtype=self.dtype)
         actions = torch.randn(1,
                               self.job_config.action_dim,
                               frame_chunk_size,
@@ -465,15 +484,16 @@ class VA_Server:
         action_inference_step = self.job_config.action_num_inference_steps
         video_step = self.job_config.video_exec_step
 
-        self.scheduler.set_timesteps(video_inference_step)
+        if video_run_mode:
+            self.scheduler.set_timesteps(video_inference_step)
         self.action_scheduler.set_timesteps(action_inference_step)
-        timesteps = self.scheduler.timesteps
+        timesteps = self.scheduler.timesteps if video_run_mode else None
         action_timesteps = self.action_scheduler.timesteps
 
-        timesteps = F.pad(timesteps, (0, 1), mode='constant', value=0)
-
-        if video_step != -1:
-            timesteps = timesteps[:video_step]
+        if video_run_mode:
+            timesteps = F.pad(timesteps, (0, 1), mode='constant', value=0)
+            if video_step != -1:
+                timesteps = timesteps[:video_step]
 
         action_timesteps = F.pad(
             action_timesteps,
@@ -485,41 +505,47 @@ class VA_Server:
         with (
                 torch.no_grad(),
         ):
-            # 1. Video Generation Loop
-            for i, t in enumerate(tqdm(timesteps)):
-                last_step = i == len(timesteps) - 1
-                latent_cond = init_latent[:, :, 0:1].to(
-                    self.dtype) if frame_st_id == 0 else None
-                input_dict = self._prepare_latent_input(
-                    latents,
-                    None,
-                    t,
-                    t,
-                    latent_cond,
-                    None,
-                    frame_st_id=frame_st_id)
+            # FastWAM action queries cannot attend to the current chunk's future
+            # video tokens, so deployment can skip this entire branch.
+            if video_run_mode:
+                for i, t in enumerate(tqdm(timesteps)):
+                    last_step = i == len(timesteps) - 1
+                    if action_condition_mode == "fastwam" and last_step:
+                        # FastWAM action queries cannot read this chunk's future
+                        # video, so the cache-only terminal video pass is useless.
+                        continue
+                    latent_cond = init_latent[:, :, 0:1].to(
+                        self.dtype) if frame_st_id == 0 else None
+                    input_dict = self._prepare_latent_input(
+                        latents,
+                        None,
+                        t,
+                        t,
+                        latent_cond,
+                        None,
+                        frame_st_id=frame_st_id)
 
-                video_noise_pred = self.transformer(
-                    self._repeat_input_for_cfg(input_dict['latent_res_lst']),
-                    update_cache=1 if last_step else 0,
-                    cache_name=self.cache_name,
-                    action_mode=False)
+                    video_noise_pred = self.transformer(
+                        self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+                        update_cache=1 if last_step else 0,
+                        cache_name=self.cache_name,
+                        action_mode=False)
 
-                if not last_step or video_step != -1:
-                    video_noise_pred = data_seq_to_patch(
-                        self.job_config.patch_size, video_noise_pred,
-                        frame_chunk_size, self.latent_height,
-                        self.latent_width, batch_size=2 if self.use_cfg else 1)
-                    if self.job_config.guidance_scale > 1:
-                        video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
-                    else:
-                        video_noise_pred = video_noise_pred[:1]
-                    latents = self.scheduler.step(video_noise_pred,
-                                                  t,
-                                                  latents,
-                                                  return_dict=False)
+                    if not last_step or video_step != -1:
+                        video_noise_pred = data_seq_to_patch(
+                            self.job_config.patch_size, video_noise_pred,
+                            frame_chunk_size, self.latent_height,
+                            self.latent_width, batch_size=2 if self.use_cfg else 1)
+                        if self.job_config.guidance_scale > 1:
+                            video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
+                        else:
+                            video_noise_pred = video_noise_pred[:1]
+                        latents = self.scheduler.step(video_noise_pred,
+                                                      t,
+                                                      latents,
+                                                      return_dict=False)
 
-                latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
+                    latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
 
             for i, t in enumerate(tqdm(action_timesteps)):
                 last_step = i == len(action_timesteps) - 1
@@ -562,7 +588,8 @@ class VA_Server:
 
         actions[:, ~self.action_mask] *= 0
 
-        save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
+        if latents is not None:
+            save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
         save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
 
         actions = self.postprocess_action(actions)
