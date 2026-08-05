@@ -1,0 +1,4 @@
+interface:
+  display_name: "LingBot-VA Offline Evaluation"
+  short_description: "Evaluate IDM and FastWAM episode trajectories"
+  default_prompt: "Use $evaluate-lingbotva-offline to evaluate matched IDM and FastWAM checkpoints over a complete episode."
