@@ -183,6 +183,8 @@ def persist_run_contracts(
 
     policy_contract_keys = (
         "action_condition_mode",
+        "model_structure",
+        "mot_config",
         "visual_contract",
         "raw_image_hw",
         "reshape_mode",
@@ -280,6 +282,8 @@ def persist_run_contracts(
             "config_name": config_name,
             "visual_contract": policy_contract["visual_contract"],
             "action_condition_mode": policy_contract["action_condition_mode"],
+            "model_structure": policy_contract["model_structure"],
+            "mot_config": policy_contract["mot_config"],
             "latent_canvas_hwc": [*latent_canvas_hw, int(_required(resolved, "expected_latent_channels"))],
             "visual_tokens_per_frame": visual_tokens,
             "dataset_manifest_sha256": dataset_manifest_sha256,
