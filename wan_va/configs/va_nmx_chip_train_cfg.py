@@ -182,6 +182,33 @@ va_nmx_chip_train_mot_cfg.model_structure = "mot"
 va_nmx_chip_train_mot_cfg.mot_config = {"action_hidden_dim": 768, "action_mlp_hidden_dim": 256, "init_mode": "video_interp_alpha"}
 
 
+# Fold-towel task config. Only task-owned data assets differ from the existing
+# MoT + FastWAM upstream single-canvas baseline.
+va_nmx_fold_towel_train_mot_fastwam_cfg = deepcopy(va_nmx_chip_train_mot_cfg)
+va_nmx_fold_towel_train_mot_fastwam_cfg.__name__ = (
+    "Config: NMX fold towel train, MoT FastWAM, upstream single-canvas"
+)
+va_nmx_fold_towel_train_mot_fastwam_cfg.dataset_path = [
+    "/mnt/dataset/fold_towel_correction_20260804",
+    "/mnt/dataset/fold_towel_overall_20260804",
+]
+va_nmx_fold_towel_train_mot_fastwam_cfg.empty_emb_path = (
+    "/mnt/dataset/fold_towel_overall_20260804/empty_emb.pt"
+)
+va_nmx_fold_towel_train_mot_fastwam_cfg.text_emb_override_path = (
+    "/mnt/workspace/shenyibo/lingbot-va-assets/fold_towel_20260804/prompt_text_emb.pt"
+)
+va_nmx_fold_towel_train_mot_fastwam_cfg.text_emb_override_sha256 = (
+    "31bf55eb231ce3a5b4d0b0b3a6b8e262d7dc79ea51bfc9381e6dd8947b12727b"
+)
+va_nmx_fold_towel_train_mot_fastwam_cfg.task_prompt_override = (
+    "Fold the towel in half twice"
+)
+va_nmx_fold_towel_train_mot_fastwam_cfg.action_norm_stats_path = (
+    "/mnt/workspace/shenyibo/lingbot-va-assets/fold_towel_20260804/lingbot_action_norm_stats.json"
+)
+
+
 va_nmx_chip_train_per_view_pad_fastwam_cfg = deepcopy(
     va_nmx_chip_train_per_view_pad_cfg
 )
