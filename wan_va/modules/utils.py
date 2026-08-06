@@ -1,4 +1,7 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+import json
+from pathlib import Path
+
 import torch
 from diffusers import AutoencoderKLWan
 from transformers import (
@@ -7,6 +10,18 @@ from transformers import (
 )
 
 from .model import WanTransformer3DModel
+
+
+def _read_transformer_config(transformer_path):
+    """Read local metadata; legacy checkpoints default to the shared backbone."""
+    path = Path(str(transformer_path)).expanduser()
+    config_path = path / "config.json"
+    if not config_path.is_file():
+        return {}
+    try:
+        return json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
 
 
 def load_vae(
@@ -44,11 +59,45 @@ def load_transformer(
     torch_device,
     **kwargs
 ):
-    model = WanTransformer3DModel.from_pretrained(
-        transformer_path,
-        torch_dtype=torch_dtype,
-        **kwargs
+    requested_structure = kwargs.pop("model_structure", None)
+    mot_config = dict(kwargs.pop("mot_config", {}) or {})
+    checkpoint_config = _read_transformer_config(transformer_path)
+    model_structure = str(
+        requested_structure or checkpoint_config.get("model_structure", "shared")
     )
+    if model_structure not in {"shared", "mot"}:
+        raise ValueError(
+            "model_structure must be 'shared' or 'mot', "
+            f"got {model_structure!r}"
+        )
+    if model_structure == "mot":
+        from .mot_support.model import WanTransformer3DModel as MotSharedModel
+        from .mot_support.model_mot import WanTransformer3DMoTModel
+        source_structure = str(checkpoint_config.get("model_structure", "shared"))
+        if source_structure == "mot":
+            model = WanTransformer3DMoTModel.from_pretrained(
+                transformer_path, torch_dtype=torch_dtype, **kwargs
+            )
+        else:
+            shared_model = MotSharedModel.from_pretrained(
+                transformer_path, torch_dtype=torch_dtype, **kwargs
+            )
+            model = WanTransformer3DMoTModel.from_shared_model(
+                shared_model,
+                action_hidden_dim=int(
+                    mot_config.get("action_hidden_dim", 768)
+                ),
+                action_ffn_dim=mot_config.get("action_ffn_dim"),
+                action_mlp_hidden_dim=int(
+                    mot_config.get("action_mlp_hidden_dim", 256)
+                ),
+                init_mode=str(mot_config.get("init_mode", "video_interp_alpha")),
+                alpha_scale=mot_config.get("alpha_scale"),
+            )
+    else:
+        model = WanTransformer3DModel.from_pretrained(
+            transformer_path, torch_dtype=torch_dtype, **kwargs
+        )
     return model.to(torch_device)
 
 

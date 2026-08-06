@@ -14,6 +14,7 @@ from .va_nmx_chip_train_cfg import (
     va_nmx_chip_episode109_overfit_cfg,
     va_nmx_chip_train_cfg,
     va_nmx_chip_train_fastwam_cfg,
+    va_nmx_chip_train_mot_cfg,
     va_nmx_chip_train_per_view_pad_cfg,
     va_nmx_chip_train_per_view_pad_fastwam_cfg,
 )
@@ -32,6 +33,7 @@ VA_CONFIGS = {
     'libero_i2av': va_libero_i2va_cfg,
     'nmx_chip_train': va_nmx_chip_train_cfg,
     'nmx_chip_train_fastwam': va_nmx_chip_train_fastwam_cfg,
+    'nmx_chip_train_mot': va_nmx_chip_train_mot_cfg,
     'nmx_chip_train_per_view_pad': va_nmx_chip_train_per_view_pad_cfg,
     'nmx_chip_train_per_view_pad_fastwam': va_nmx_chip_train_per_view_pad_fastwam_cfg,
     'nmx_chip_episode109_overfit': va_nmx_chip_episode109_overfit_cfg,

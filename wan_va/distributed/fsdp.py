@@ -26,9 +26,23 @@ def shard_model(model,
     fsdp_config = {"mp_policy": mp_policy, "reshard_after_forward": True}
 
     for block in model.blocks:
-        fully_shard(block.attn1, **fsdp_config)
-        fully_shard(block.attn2, **fsdp_config)
-        fully_shard(block.ffn, **fsdp_config)
+        # Shared blocks expose attn1/attn2/ffn; MoT blocks expose separate
+        # video/action streams. Shard every stream-specific projection while
+        # keeping the enclosing block as the FSDP unit.
+        submodules = (
+            (block.attn1, block.attn2, block.ffn)
+            if hasattr(block, "attn1")
+            else (
+                block.video_attn1,
+                block.video_attn2,
+                block.video_ffn,
+                block.action_attn1,
+                block.action_attn2,
+                block.action_ffn,
+            )
+        )
+        for submodule in submodules:
+            fully_shard(submodule, **fsdp_config)
         fully_shard(block, **fsdp_config)
 
     fully_shard(model, **fsdp_config)

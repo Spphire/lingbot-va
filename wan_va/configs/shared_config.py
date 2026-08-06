@@ -11,5 +11,7 @@ va_shared_cfg.param_dtype = torch.bfloat16
 va_shared_cfg.save_root = './train_out'
 
 va_shared_cfg.patch_size = (1, 2, 2)
+va_shared_cfg.model_structure = "shared"
+va_shared_cfg.mot_config = {}
 
 va_shared_cfg.enable_offload = False

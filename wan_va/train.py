@@ -179,6 +179,8 @@ class Trainer:
             action_condition_mode=str(
                 getattr(config, "action_condition_mode", "inverse_dynamics")
             ),
+                model_structure=str(getattr(config, "model_structure", "shared")),
+                mot_config=dict(getattr(config, "mot_config", {}) or {}),
         )
 
         logger.info("Setting up activation checkpointing ...")
