@@ -137,6 +137,9 @@ fi
 if [[ -n "${DATASET_PATH:-}" ]]; then
   ARGS+=(--dataset-path "${DATASET_PATH}")
 fi
+if [[ -n "${DATASET_MANIFEST_PATH:-}" ]]; then
+  ARGS+=(--dataset-manifest "${DATASET_MANIFEST_PATH}")
+fi
 if [[ -n "${MODEL_PATH:-}" ]]; then
   ARGS+=(--model-path "${MODEL_PATH}")
 fi

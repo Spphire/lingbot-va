@@ -182,3 +182,19 @@ va_nmx_chip_train_per_view_pad_fastwam_cfg.__name__ = (
     "Config: NMX chip train, per-view padding, FastWAM action conditioning"
 )
 va_nmx_chip_train_per_view_pad_fastwam_cfg.action_condition_mode = "fastwam"
+
+
+va_nmx_chip_episode109_overfit_cfg = deepcopy(va_nmx_chip_train_cfg)
+va_nmx_chip_episode109_overfit_cfg.__name__ = (
+    "Config: NMX chip episode 109 overfit audit"
+)
+va_nmx_chip_episode109_overfit_cfg.dataset_path = [
+    "/mnt/workspace/shenyibo/datasets/chip_0711_199episodes"
+]
+va_nmx_chip_episode109_overfit_cfg.episode_index_filter = [109]
+va_nmx_chip_episode109_overfit_cfg.max_latent_frames = None
+va_nmx_chip_episode109_overfit_cfg.cfg_prob = 0.0
+va_nmx_chip_episode109_overfit_cfg.load_worker = 1
+va_nmx_chip_episode109_overfit_cfg.num_init_worker = 1
+va_nmx_chip_episode109_overfit_cfg.num_steps = 1000
+va_nmx_chip_episode109_overfit_cfg.save_interval = 100

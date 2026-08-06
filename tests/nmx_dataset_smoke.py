@@ -15,26 +15,32 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--dataset-root",
-        default="/mnt/workspace/shenyibo/datasets/chip_0709_1952episodes",
+        default=None,
+        help="Override the selected config's dataset root",
     )
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--all-recorded", action="store_true")
     parser.add_argument(
         "--config-name",
-        choices=("nmx_chip_train", "nmx_chip_train_per_view_pad"),
+        choices=(
+            "nmx_chip_train",
+            "nmx_chip_train_per_view_pad",
+            "nmx_chip_episode109_overfit",
+        ),
         default="nmx_chip_train",
     )
     args = parser.parse_args()
 
     config = deepcopy(VA_CONFIGS[args.config_name])
-    if not args.all_recorded:
+    if not args.all_recorded and args.dataset_root is not None:
         config.dataset_path = args.dataset_root
     config.cfg_prob = 0.0
     dataset = MultiLatentLeRobotDataset(config=config, num_init_worker=1)
     sample = dataset[args.sample_index]
     batch = next(iter(DataLoader(dataset, batch_size=1, num_workers=0)))
 
-    assert sample["latents"].shape[1] <= config.max_latent_frames
+    if config.max_latent_frames is not None:
+        assert sample["latents"].shape[1] <= config.max_latent_frames
     assert sample["raw_actions"].shape == sample["raw_states"].shape
     assert sample["raw_actions"].shape[-1] == 23
     assert not sample["raw_actions_step_mask"][0].any()

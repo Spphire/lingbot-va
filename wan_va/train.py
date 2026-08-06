@@ -56,6 +56,7 @@ from wan_va.dataset.nmx_action_adapter import (
     uses_nmx_action_contract,
 )
 from wan_va.dataset.empty_embedding import generate_empty_embedding
+from wan_va.run_contract import persist_run_contracts, write_checkpoint_manifest
 import gc
 
 
@@ -105,7 +106,7 @@ def seed_training_process(seed, rank):
 
 
 class Trainer:
-    def __init__(self, config):
+    def __init__(self, config, run_contract=None):
         if config.enable_wandb and config.rank == 0:
             wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
             self.wandb = wandb
@@ -121,6 +122,7 @@ class Trainer:
             logger.info("WandB logging enabled")
         self.step = 0
         self.config = config
+        self.run_contract = run_contract
         self.device = torch.device(f"cuda:{config.local_rank}")
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
@@ -562,6 +564,12 @@ class Trainer:
                     module.state_dict(),
                     module.config,
                 )
+                if self.run_contract is not None:
+                    write_checkpoint_manifest(
+                        checkpoint_dir,
+                        step=self.step,
+                        run_contract=self.run_contract,
+                    )
         else:
             state_dict = get_model_state_dict(
                 self.transformer,
@@ -574,6 +582,12 @@ class Trainer:
                     state_dict,
                     self._unwrap_transformer().config,
                 )
+                if self.run_contract is not None:
+                    write_checkpoint_manifest(
+                        checkpoint_dir,
+                        step=self.step,
+                        run_contract=self.run_contract,
+                    )
 
         if dist.is_initialized():
             dist.barrier()
@@ -688,6 +702,11 @@ class Trainer:
 
                 if self.config.rank == 0:
                     total_norm = losses['total_norm']
+                    max_latent_frames = getattr(
+                        self.config,
+                        'max_latent_frames',
+                        0,
+                    )
                     progress_bar.n += 1
                     progress_bar.set_postfix({
                         'latent_loss': f'{latent_loss_show:.4f}',
@@ -721,8 +740,10 @@ class Trainer:
                         'train/action_history_condition_dropout_dropped_samples': int(
                             round(action_history_dropped_show)
                         ),
-                        'data/allowed_max_latent_frames': int(
-                            getattr(self.config, 'max_latent_frames', 0)
+                        'data/allowed_max_latent_frames': (
+                            None
+                            if max_latent_frames is None
+                            else int(max_latent_frames)
                         ),
                         'timestamp': time.time(),
                     }
@@ -797,6 +818,8 @@ def run(args):
         config.save_interval = args.save_interval
     if args.disable_wandb:
         config.enable_wandb = False
+    if args.dataset_manifest is not None:
+        config.dataset_manifest_path = args.dataset_manifest
 
     if float(getattr(config, 'cfg_prob', 0.0)) > 0:
         configured_empty_emb = Path(config.empty_emb_path)
@@ -825,6 +848,22 @@ def run(args):
                 f"Empty prompt embedding was not created: {empty_emb_path}"
             )
 
+    run_contract = None
+    if getattr(config, "action_contract", None) == "nmx_chunk_relative_v10":
+        dataset_manifest_path = getattr(config, "dataset_manifest_path", None)
+        if not dataset_manifest_path:
+            raise ValueError(
+                "NMX training requires --dataset-manifest so the run is self-describing"
+            )
+        if rank == 0:
+            run_contract = persist_run_contracts(
+                config,
+                config_name=args.config_name,
+                launch_args=vars(args),
+                dataset_manifest_path=dataset_manifest_path,
+                repo_root=Path(__file__).resolve().parents[1],
+            )
+
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")
         logger.info(
@@ -832,7 +871,7 @@ def run(args):
             f"local rank: {local_rank}"
         )
 
-    trainer = Trainer(config)
+    trainer = Trainer(config, run_contract=run_contract)
     trainer.train()
 
 
@@ -862,6 +901,7 @@ def main():
     )
     parser.add_argument("--resume-from", default=None)
     parser.add_argument("--dataset-path", default=None)
+    parser.add_argument("--dataset-manifest", default=None)
     parser.add_argument("--empty-emb-path", default=None)
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--num-workers", type=int, default=None)

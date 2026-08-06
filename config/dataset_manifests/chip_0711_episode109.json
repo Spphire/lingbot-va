@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "dataset_group": "chip_0711_episode109_overfit_audit",
+  "ordered_roots": [
+    {
+      "path": "/mnt/workspace/shenyibo/datasets/chip_0711_199episodes",
+      "episodes": 1,
+      "segments": 1,
+      "episode_indices": [109]
+    }
+  ],
+  "total_episodes": 1,
+  "total_segments": 1,
+  "action_contract": {
+    "name": "nmx_chunk_relative_v10",
+    "relative_pose_frame": "local_frame",
+    "action_chunk_size_min": 1,
+    "action_chunk_size_max": 4,
+    "chunk_grouping_start_from_one": true,
+    "normalizer_filename": "lingbot_action_norm_stats.json",
+    "normalizer_sha256": "42becf6bda424620e5fc9ed65da3edff6738cad966f785b546b00fe64dbab6d6"
+  }
+}
