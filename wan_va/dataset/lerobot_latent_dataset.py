@@ -377,7 +377,7 @@ class LatentLeRobotDataset(LeRobotDataset):
     def parse_meta(self):
         out = []
         configured_episode_indices = getattr(
-            self.config,
+            getattr(self, 'config', None),
             'episode_index_filter',
             None,
         )
