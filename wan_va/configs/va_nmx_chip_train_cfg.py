@@ -175,11 +175,27 @@ va_nmx_chip_train_fastwam_cfg.__name__ = (
 )
 va_nmx_chip_train_fastwam_cfg.action_condition_mode = "fastwam"
 
-# Optional MoT structure with the same upstream 30D/FastWAM data contract.
-va_nmx_chip_train_mot_cfg = deepcopy(va_nmx_chip_train_fastwam_cfg)
-va_nmx_chip_train_mot_cfg.__name__ = "Config: NMX chip train, MoT FastWAM"
-va_nmx_chip_train_mot_cfg.model_structure = "mot"
-va_nmx_chip_train_mot_cfg.mot_config = {"action_hidden_dim": 768, "action_mlp_hidden_dim": 256, "init_mode": "video_interp_alpha"}
+_NMX_MOT_CONFIG = {
+    "action_hidden_dim": 768,
+    "action_mlp_hidden_dim": 256,
+    "init_mode": "video_interp_alpha",
+}
+
+# Model structure and action conditioning are independent checkpoint contracts.
+va_nmx_chip_train_mot_idm_cfg = deepcopy(va_nmx_chip_train_cfg)
+va_nmx_chip_train_mot_idm_cfg.__name__ = "Config: NMX chip train, MoT IDM"
+va_nmx_chip_train_mot_idm_cfg.model_structure = "mot"
+va_nmx_chip_train_mot_idm_cfg.mot_config = deepcopy(_NMX_MOT_CONFIG)
+
+va_nmx_chip_train_mot_fastwam_cfg = deepcopy(va_nmx_chip_train_fastwam_cfg)
+va_nmx_chip_train_mot_fastwam_cfg.__name__ = (
+    "Config: NMX chip train, MoT FastWAM"
+)
+va_nmx_chip_train_mot_fastwam_cfg.model_structure = "mot"
+va_nmx_chip_train_mot_fastwam_cfg.mot_config = deepcopy(_NMX_MOT_CONFIG)
+
+# Backward-compatible name used by existing MoT+FastWAM run manifests.
+va_nmx_chip_train_mot_cfg = va_nmx_chip_train_mot_fastwam_cfg
 
 
 # Fold-towel task config. Only task-owned data assets differ from the existing

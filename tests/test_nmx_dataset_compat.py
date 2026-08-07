@@ -231,6 +231,36 @@ def test_fastwam_visual_ab_configs_change_only_action_mode_and_visual_contract()
     assert baseline_values == padded_values
 
 
+def test_model_structure_and_action_condition_form_independent_matrix():
+    configs = {
+        ("shared", "inverse_dynamics"): VA_CONFIGS["nmx_chip_train"],
+        ("shared", "fastwam"): VA_CONFIGS["nmx_chip_train_fastwam"],
+        ("mot", "inverse_dynamics"): VA_CONFIGS["nmx_chip_train_mot_idm"],
+        ("mot", "fastwam"): VA_CONFIGS["nmx_chip_train_mot_fastwam"],
+    }
+
+    assert set(configs) == {
+        ("shared", "inverse_dynamics"),
+        ("shared", "fastwam"),
+        ("mot", "inverse_dynamics"),
+        ("mot", "fastwam"),
+    }
+    for (structure, action_mode), config in configs.items():
+        assert config.model_structure == structure
+        assert config.action_condition_mode == action_mode
+        assert bool(config.mot_config) == (structure == "mot")
+
+    assert VA_CONFIGS["nmx_chip_train_mot"] is configs[("mot", "fastwam")]
+
+    reference = dict(configs[("shared", "inverse_dynamics")])
+    for config in configs.values():
+        candidate = dict(config)
+        for key in ("__name__", "model_structure", "mot_config", "action_condition_mode"):
+            reference.pop(key, None)
+            candidate.pop(key, None)
+        assert candidate == reference
+
+
 def test_text_embedding_override_is_loaded_once_and_replaces_cached_text(tmp_path):
     override = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
     override_path = tmp_path / "prompt_text_emb.pt"
