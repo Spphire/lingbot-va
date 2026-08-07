@@ -209,6 +209,20 @@ va_nmx_fold_towel_train_mot_fastwam_cfg.action_norm_stats_path = (
 )
 
 
+# Shared-backbone ablation for the same fold-towel/FastWAM contract. Only the
+# model structure differs from the MoT run; all data and optimization settings
+# remain identical for a valid architecture comparison.
+va_nmx_fold_towel_train_fastwam_cfg = deepcopy(
+    va_nmx_fold_towel_train_mot_fastwam_cfg
+)
+va_nmx_fold_towel_train_fastwam_cfg.__name__ = (
+    "Config: NMX fold towel train, shared FastWAM, upstream single-canvas"
+)
+va_nmx_fold_towel_train_fastwam_cfg.model_structure = "shared"
+va_nmx_fold_towel_train_fastwam_cfg.mot_config = {}
+va_nmx_fold_towel_train_fastwam_cfg.save_interval = 1000
+
+
 va_nmx_chip_train_per_view_pad_fastwam_cfg = deepcopy(
     va_nmx_chip_train_per_view_pad_cfg
 )
