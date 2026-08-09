@@ -67,6 +67,8 @@ va_nmx_chip_train_cfg.env_type = "none"
 va_nmx_chip_train_cfg.height = 320
 va_nmx_chip_train_cfg.width = 240
 va_nmx_chip_train_cfg.visual_contract = "upstream_single_canvas_v1"
+va_nmx_chip_train_cfg.visual_tokens_per_frame = 150
+va_nmx_chip_train_cfg.latent_canvas_hwc = [20, 30, 48]
 va_nmx_chip_train_cfg.expected_latent_view_shapes = [(20, 15), (20, 15)]
 va_nmx_chip_train_cfg.expected_latent_channels = 48
 va_nmx_chip_train_cfg.action_dim = 30
@@ -165,6 +167,8 @@ va_nmx_chip_train_per_view_pad_cfg.__name__ = (
 va_nmx_chip_train_per_view_pad_cfg.visual_contract = (
     "per_view_zero_pad_then_concat_v1"
 )
+va_nmx_chip_train_per_view_pad_cfg.visual_tokens_per_frame = 160
+va_nmx_chip_train_per_view_pad_cfg.latent_canvas_hwc = [20, 32, 48]
 
 
 # FastWAM keeps the original shared LingBot-VA backbone and changes only the
