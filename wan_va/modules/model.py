@@ -15,6 +15,7 @@ from diffusers.models.embeddings import (
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
 from einops import rearrange
+from collections import namedtuple
 from typing import Callable, ClassVar
 from torch.nn.attention.flex_attention import (
     _mask_mod_signature,
@@ -34,6 +35,37 @@ except:
     from flash_attn import flash_attn_func
 
 __all__ = ['WanTransformer3DModel']
+
+
+try:
+    _compiler_disable = torch.compiler.disable
+except AttributeError:  # pragma: no cover - old torch fallback
+    def _compiler_disable(fn):
+        return fn
+
+
+_CrossKVCache = namedtuple("_CrossKVCache", ("context", "key", "value"))
+
+
+def compile_transformer_blocks(
+    blocks: nn.ModuleList,
+    *,
+    mode: str = "default",
+    dynamic: bool | None = None,
+) -> bool:
+    """Compile block compute while keeping stateful KV helpers eager."""
+    originals = list(blocks)
+    if not originals or all(hasattr(block, "_orig_mod") for block in originals):
+        return False
+    try:
+        for index, block in enumerate(originals):
+            if not hasattr(block, "_orig_mod"):
+                blocks[index] = torch.compile(block, mode=mode, dynamic=dynamic)
+    except Exception:
+        for index, block in enumerate(originals):
+            blocks[index] = block
+        raise
+    return True
 
 
 def custom_sdpa(q, k, v):
@@ -388,87 +420,175 @@ class WanAttention(torch.nn.Module):
                                        eps=eps,
                                        elementwise_affine=True)
         self.attn_caches = {} if cross_attention_dim_head is None else None
+        self._cross_kv_cache = {}
 
     def clear_pred_cache(self, cache_name):
         if self.attn_caches is None:
             return
-        cache = self.attn_caches[cache_name]
-        is_pred = cache['is_pred']
-        cache['mask'][is_pred] = False
+        cache = self.attn_caches.get(cache_name)
+        if cache is None:
+            return
+        pred_len = int(cache.get("pred_len", 0))
+        if pred_len <= 0:
+            return
+        valid_len = int(cache["valid_len"])
+        new_valid = max(0, valid_len - pred_len)
+        cache["mask"][new_valid:valid_len] = False
+        cache["id"][new_valid:valid_len] = -1
+        cache["is_pred"][new_valid:valid_len] = False
+        cache["valid_len"] = new_valid
+        cache["write_pos"] = new_valid
+        cache["pred_len"] = 0
 
     def clear_cache(self, cache_name):
         if self.attn_caches is None:
             return
         self.attn_caches[cache_name] = None
 
+    @_compiler_disable
+    @torch.no_grad()
+    def cache_cross_kv(self, encoder_hidden_states, cache_name='pos'):
+        if self.cross_attention_dim_head is None:
+            return
+        key = self.norm_k(self.to_k(encoder_hidden_states))
+        key = key.unflatten(2, (self.heads, -1))
+        value = self.to_v(encoder_hidden_states).unflatten(2, (self.heads, -1))
+        self._cross_kv_cache[cache_name] = _CrossKVCache(
+            encoder_hidden_states, key, value
+        )
+
+    @_compiler_disable
+    def clear_cross_kv(self, cache_name=None):
+        if cache_name is None:
+            self._cross_kv_cache.clear()
+        else:
+            self._cross_kv_cache.pop(cache_name, None)
+
+    @_compiler_disable
+    def _cross_kv(self, key_input, value_input, cache_name):
+        entry = self._cross_kv_cache.get(cache_name)
+        if entry is not None and entry.context is key_input:
+            return entry.key, entry.value
+        key = self.norm_k(self.to_k(key_input)).unflatten(2, (self.heads, -1))
+        value = self.to_v(value_input).unflatten(2, (self.heads, -1))
+        return key, value
+
     def init_kv_cache(self, cache_name, total_tolen, num_head, head_dim,
-                      device, dtype, batch_size):
+                      device, dtype, batch_size, headroom=0):
         if self.attn_caches is None:
             return
+        capacity = int(total_tolen)
+        physical_len = capacity + int(headroom)
         self.attn_caches[cache_name] = {
             'k':
-            torch.empty([batch_size, total_tolen, num_head, head_dim],
+            torch.empty([batch_size, physical_len, num_head, head_dim],
                         device=device,
                         dtype=dtype),
             'v':
-            torch.empty([batch_size, total_tolen, num_head, head_dim],
+            torch.empty([batch_size, physical_len, num_head, head_dim],
                         device=device,
                         dtype=dtype),
-            'id':
-            torch.full((total_tolen, ), -1, device=device),
+            'id': torch.full((physical_len, ), -1, device=device),
             "mask":
-            torch.zeros((total_tolen, ), dtype=torch.bool, device=device),
+            torch.zeros((physical_len, ), dtype=torch.bool, device=device),
             "is_pred":
-            torch.zeros((total_tolen, ), dtype=torch.bool, device=device),
+            torch.zeros((physical_len, ), dtype=torch.bool, device=device),
+            "capacity": capacity,
+            "headroom": int(headroom),
+            "write_pos": 0,
+            "valid_len": 0,
+            "pred_len": 0,
+            "next_id": 0,
         }
 
-    def allocate_slots(self, cache_name, key_size):
-        cache = self.attn_caches[cache_name]
-        mask = cache["mask"]
-        ids = cache["id"]
-        free = (~mask).nonzero(as_tuple=False).squeeze(-1)
-
-        if free.numel() < key_size:
-            used = mask.nonzero(as_tuple=False).squeeze(-1)
-
-            used_ids = ids[used]
-            order = torch.argsort(used_ids)
-            need = key_size - free.numel()
-            to_free = used[order[:need]]
-
-            mask[to_free] = False
-            ids[to_free] = -1
-            free = (~mask).nonzero(as_tuple=False).squeeze(-1)
-
-        assert free.numel() >= key_size
-        return free[:key_size]
-
     def _next_cache_id(self, cache_name):
-        ids = self.attn_caches[cache_name]['id']
-        mask = self.attn_caches[cache_name]['mask']
+        cache = self.attn_caches[cache_name]
+        cache_id = int(cache["next_id"])
+        cache["next_id"] = cache_id + 1
+        return cache_id
 
-        if mask.any():
-            return ids[mask].max() + 1
-        else:
-            return torch.tensor(0, device=ids.device, dtype=ids.dtype)
+    @_compiler_disable
+    def _evict_oldest(self, cache, evict_len):
+        if evict_len <= 0:
+            return
+        valid_len = int(cache["valid_len"])
+        pred_len = int(cache["pred_len"])
+        if evict_len >= valid_len:
+            cache["mask"][:valid_len] = False
+            cache["id"][:valid_len] = -1
+            cache["is_pred"][:valid_len] = False
+            cache["valid_len"] = 0
+            cache["write_pos"] = 0
+            cache["pred_len"] = 0
+            return
+        new_valid = valid_len - evict_len
+        cache["k"][:, :new_valid] = cache["k"][:, evict_len:valid_len].clone()
+        cache["v"][:, :new_valid] = cache["v"][:, evict_len:valid_len].clone()
+        cache["id"][:new_valid] = cache["id"][evict_len:valid_len].clone()
+        cache["mask"][:new_valid] = cache["mask"][evict_len:valid_len].clone()
+        cache["is_pred"][:new_valid] = cache["is_pred"][evict_len:valid_len].clone()
+        cache["mask"][new_valid:valid_len] = False
+        cache["id"][new_valid:valid_len] = -1
+        cache["is_pred"][new_valid:valid_len] = False
+        cache["valid_len"] = new_valid
+        cache["write_pos"] = new_valid
+        non_pred = valid_len - pred_len
+        if evict_len > non_pred:
+            cache["pred_len"] = max(0, pred_len - (evict_len - non_pred))
 
+    @_compiler_disable
     def update_cache(self, cache_name, key, value, is_pred):
         cache = self.attn_caches[cache_name]
-
-        key_size = key.shape[1]
-        slots = self.allocate_slots(cache_name, key_size)
-
+        if not is_pred and int(cache["pred_len"]) > 0:
+            self.clear_pred_cache(cache_name)
+        capacity = int(cache["capacity"])
+        key_size = int(key.shape[1])
+        if key_size >= capacity:
+            key = key[:, -capacity:]
+            value = value[:, -capacity:]
+            key_size = capacity
+            self._evict_oldest(cache, int(cache["valid_len"]))
+        valid_len = int(cache["valid_len"])
+        overflow = valid_len + key_size - capacity
+        if overflow > 0:
+            self._evict_oldest(cache, overflow)
+            valid_len = int(cache["valid_len"])
         new_id = self._next_cache_id(cache_name)
+        end = valid_len + key_size
+        cache["k"][:, valid_len:end] = key
+        cache["v"][:, valid_len:end] = value
+        cache["id"][valid_len:end] = new_id
+        cache["mask"][valid_len:end] = True
+        cache["is_pred"][valid_len:end] = is_pred
+        cache["valid_len"] = end
+        cache["write_pos"] = end
+        cache["pred_len"] = (
+            min(end, int(cache["pred_len"]) + key_size) if is_pred else 0
+        )
 
-        cache['k'][:, slots] = key
-        cache['v'][:, slots] = value
-        cache['mask'][slots] = True
-        cache['id'][slots] = new_id
-        cache['is_pred'][slots] = is_pred
-        return slots
+    @_compiler_disable
+    def _get_cached_kv(self, cache_name):
+        cache = self.attn_caches.get(cache_name)
+        if cache is None or int(cache["valid_len"]) == 0:
+            return None, None
+        valid_len = int(cache["valid_len"])
+        return cache["k"][:, :valid_len], cache["v"][:, :valid_len]
 
-    def restore_cache(self, cache_name, slots):
-        self.attn_caches[cache_name]['mask'][slots] = False
+    @_compiler_disable
+    def _stage_and_view(self, cache_name, key, value):
+        cache = self.attn_caches[cache_name]
+        valid_len = int(cache["valid_len"])
+        end = valid_len + int(key.shape[1])
+        if end > cache["k"].shape[1]:
+            if valid_len == 0:
+                return key, value
+            return (
+                torch.cat([cache["k"][:, :valid_len], key], dim=1),
+                torch.cat([cache["v"][:, :valid_len], value], dim=1),
+            )
+        cache["k"][:, valid_len:end] = key
+        cache["v"][:, valid_len:end] = value
+        return cache["k"][:, :end], cache["v"][:, :end]
 
     def forward(
         self,
@@ -479,16 +599,15 @@ class WanAttention(torch.nn.Module):
         update_cache=0,
         cache_name='pos',
     ):
-        kv_cache = self.attn_caches[
-            cache_name] if (self.attn_caches is not None) and (cache_name in self.attn_caches) else None
+        kv_cache = self.attn_caches[cache_name] if (self.attn_caches is not None) and (cache_name in self.attn_caches) else None
 
-        query, key, value = self.to_q(q), self.to_k(k), self.to_v(v)
-        query = self.norm_q(query)
-        query = query.unflatten(2, (self.heads, -1))
-        key = self.norm_k(key)
-        key = key.unflatten(2, (self.heads, -1))
-        value = value.unflatten(2, (self.heads, -1))
-        if rotary_emb is not None:
+        query = self.norm_q(self.to_q(q)).unflatten(2, (self.heads, -1))
+        if self.cross_attention_dim_head is not None:
+            key, value = self._cross_kv(k, v, cache_name)
+        else:
+            key = self.norm_k(self.to_k(k)).unflatten(2, (self.heads, -1))
+            value = self.to_v(v).unflatten(2, (self.heads, -1))
+        if rotary_emb is not None and self.cross_attention_dim_head is None:
 
             def apply_rotary_emb(x, freqs):
                 x_out = torch.view_as_complex(
@@ -499,16 +618,8 @@ class WanAttention(torch.nn.Module):
             query = apply_rotary_emb(query, rotary_emb)
             key = apply_rotary_emb(key, rotary_emb)
         if kv_cache is not None and kv_cache['k'] is not None:
-            cache = self.attn_caches[cache_name]
-            valid = cache['mask'].nonzero(as_tuple=False).squeeze(-1)
             if update_cache == 0:
-                # Denoising queries are transient. Appending them through update_cache()
-                # evicts the committed context before attention when the cache is full.
-                # Keep persistent history untouched and expose history + current K/V only
-                # for this attention call.
-                if valid.numel() > 0:
-                    key = torch.cat([cache['k'][:, valid], key], dim=1)
-                    value = torch.cat([cache['v'][:, valid], value], dim=1)
+                key, value = self._stage_and_view(cache_name, key, value)
             else:
                 self.update_cache(
                     cache_name,
@@ -516,9 +627,9 @@ class WanAttention(torch.nn.Module):
                     value,
                     is_pred=(update_cache == 1),
                 )
-                valid = cache['mask'].nonzero(as_tuple=False).squeeze(-1)
-                key = cache['k'][:, valid]
-                value = cache['v'][:, valid]
+                key, value = self._get_cached_kv(cache_name)
+                if key is None or value is None:
+                    raise RuntimeError("KV cache is empty after cache update")
 
         hidden_states = self.attn_op(query, key, value)
 
@@ -723,6 +834,18 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
     def clear_cache(self, cache_name):
         for block in self.blocks:
             block.attn1.clear_cache(cache_name)
+            block.attn2.clear_cross_kv(cache_name)
+
+    def compile_blocks(self, *, mode="default", dynamic=None):
+        return compile_transformer_blocks(
+            self.blocks,
+            mode=mode,
+            dynamic=dynamic,
+        )
+
+    def cache_cross_kv(self, encoder_hidden_states, cache_name="pos"):
+        for block in self.blocks:
+            block.attn2.cache_cross_kv(encoder_hidden_states, cache_name)
 
     def clear_pred_cache(self, cache_name):
         for block in self.blocks:
@@ -733,10 +856,18 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                            device, dtype, batch_size):
         total_tolen = (attn_window // 2) * latent_token_per_chunk + (
             attn_window // 2) * action_token_per_chunk
+        headroom = max(int(latent_token_per_chunk), int(action_token_per_chunk))
         for block in self.blocks:
-            block.attn1.init_kv_cache(cache_name, total_tolen,
-                                      self.num_attention_heads,
-                                      self.attention_head_dim, device, dtype, batch_size)
+            block.attn1.init_kv_cache(
+                cache_name,
+                total_tolen,
+                self.num_attention_heads,
+                self.attention_head_dim,
+                device,
+                dtype,
+                batch_size,
+                headroom=headroom,
+            )
     
     def _input_embed(self, latents, input_type='latent'):
         if input_type == 'latent':
@@ -914,8 +1045,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 p3=self.patch_size[2])
             latent_hidden_states = self.patch_embedding_mlp(
                 latent_hidden_states)
-        text_hidden_states = self.condition_embedder.text_embedder(
-            input_dict["text_emb"])  # B L2 C
+        text_hidden_states = input_dict.get("text_hidden_states")
+        if text_hidden_states is None:
+            text_hidden_states = self.condition_embedder.text_embedder(
+                input_dict["text_emb"])
 
         latent_grid_id = input_dict['grid_id']
         rotary_emb = self.rope(latent_grid_id)[:, :, None]  # 1 L 1 C

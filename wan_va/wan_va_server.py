@@ -47,6 +47,11 @@ class VA_Server:
         self.save_root = job_config.save_root
         self.dtype = job_config.param_dtype
         self.device = torch.device(f"cuda:{job_config.local_rank}")
+        self._mesh_id_cache = {}
+        self._model_prompt_embeds = None
+        self._model_negative_prompt_embeds = None
+        self._model_prompt_text_hidden_states = None
+        self._model_cfg_text_hidden_states = None
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
 
         self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
@@ -255,13 +260,88 @@ class VA_Server:
     def _repeat_input_for_cfg(self, input_dict):
         if self.use_cfg:
             input_dict['noisy_latents'] = input_dict['noisy_latents'].repeat(2, 1, 1, 1, 1)
-            input_dict['text_emb'] = torch.cat([self.prompt_embeds.to(self.dtype).clone(), self.negative_prompt_embeds.to(self.dtype).clone()], dim=0)
+            input_dict['text_emb'] = torch.cat([
+                self._get_model_prompt_embeds(),
+                self._get_model_negative_prompt_embeds(),
+            ], dim=0)
+            input_dict['text_hidden_states'] = self._get_model_cfg_text_hidden_states()
             input_dict['grid_id'] = input_dict['grid_id'][None].repeat(2, 1, 1)
             input_dict['timesteps'] = input_dict['timesteps'][None].repeat(2, 1)
         else:
             input_dict['grid_id'] = input_dict['grid_id'][None]
             input_dict['timesteps'] = input_dict['timesteps'][None]
         return input_dict
+
+    def _refresh_model_input_cache(self):
+        """Cache prompt projections and invalidate shape-derived grids per episode."""
+        self._mesh_id_cache.clear()
+        self._model_prompt_embeds = (
+            None if self.prompt_embeds is None else
+            self.prompt_embeds.to(device=self.device, dtype=self.dtype)
+        )
+        self._model_negative_prompt_embeds = (
+            None if self.negative_prompt_embeds is None else
+            self.negative_prompt_embeds.to(device=self.device, dtype=self.dtype)
+        )
+        self._model_prompt_text_hidden_states = None
+        self._model_cfg_text_hidden_states = None
+        if self._model_prompt_embeds is not None:
+            self._model_prompt_text_hidden_states = self.transformer.condition_embedder.text_embedder(
+                self._model_prompt_embeds
+            )
+        if self.use_cfg and self._model_negative_prompt_embeds is not None:
+            cfg_embeds = torch.cat(
+                [self._model_prompt_embeds, self._model_negative_prompt_embeds], dim=0
+            )
+            self._model_cfg_text_hidden_states = self.transformer.condition_embedder.text_embedder(
+                cfg_embeds
+            )
+
+    def _get_model_prompt_embeds(self):
+        if self._model_prompt_embeds is None:
+            if self.prompt_embeds is None:
+                raise RuntimeError("Prompt embeddings are not initialized")
+            self._model_prompt_embeds = self.prompt_embeds.to(
+                device=self.device, dtype=self.dtype
+            )
+        return self._model_prompt_embeds
+
+    def _get_model_negative_prompt_embeds(self):
+        if self._model_negative_prompt_embeds is None:
+            if self.negative_prompt_embeds is None:
+                raise RuntimeError("CFG requires negative prompt embeddings")
+            self._model_negative_prompt_embeds = self.negative_prompt_embeds.to(
+                device=self.device, dtype=self.dtype
+            )
+        return self._model_negative_prompt_embeds
+
+    def _get_model_prompt_text_hidden_states(self):
+        if self._model_prompt_text_hidden_states is None:
+            self._model_prompt_text_hidden_states = self.transformer.condition_embedder.text_embedder(
+                self._get_model_prompt_embeds()
+            )
+        return self._model_prompt_text_hidden_states
+
+    def _get_model_cfg_text_hidden_states(self):
+        if self._model_cfg_text_hidden_states is None:
+            cfg_embeds = torch.cat(
+                [self._get_model_prompt_embeds(), self._get_model_negative_prompt_embeds()],
+                dim=0,
+            )
+            self._model_cfg_text_hidden_states = self.transformer.condition_embedder.text_embedder(
+                cfg_embeds
+            )
+        return self._model_cfg_text_hidden_states
+
+    def _get_mesh_id_cached(self, f, h, w, f_start, h_start, frame_st_id, action=False):
+        key = (bool(action), int(f), int(h), int(w), int(f_start), int(h_start), int(frame_st_id))
+        grid_id = self._mesh_id_cache.get(key)
+        if grid_id is None:
+            grid_id = get_mesh_id(
+                f, h, w, f_start, h_start, frame_st_id, action=action
+            ).to(self.device)
+            self._mesh_id_cache[key] = grid_id
+        return grid_id
 
     def _prepare_latent_input(self,
                               latent_model_input,
@@ -282,13 +362,14 @@ class VA_Server:
                 torch.ones([latent_model_input.shape[2]],
                            dtype=torch.float32,
                            device=self.device) * latent_t,
-                'grid_id':
-                get_mesh_id(latent_model_input.shape[-3] // patch_size[0],
-                            latent_model_input.shape[-2] // patch_size[1],
-                            latent_model_input.shape[-1] // patch_size[2], 0,
-                            1, frame_st_id).to(self.device),
-                'text_emb':
-                self.prompt_embeds.to(self.dtype).clone(),
+                'grid_id': self._get_mesh_id_cached(
+                    latent_model_input.shape[-3] // patch_size[0],
+                    latent_model_input.shape[-2] // patch_size[1],
+                    latent_model_input.shape[-1] // patch_size[2],
+                    0, 1, frame_st_id,
+                ),
+                'text_emb': self._get_model_prompt_embeds(),
+                'text_hidden_states': self._get_model_prompt_text_hidden_states(),
             }
             if latent_cond is not None:
                 input_dict['latent_res_lst'][
@@ -303,16 +384,14 @@ class VA_Server:
                 torch.ones([action_model_input.shape[2]],
                            dtype=torch.float32,
                            device=self.device) * action_t,
-                'grid_id':
-                get_mesh_id(action_model_input.shape[-3],
-                            action_model_input.shape[-2],
-                            action_model_input.shape[-1],
-                            1,
-                            1,
-                            frame_st_id,
-                            action=True).to(self.device),
-                'text_emb':
-                self.prompt_embeds.to(self.dtype).clone(),
+                'grid_id': self._get_mesh_id_cached(
+                    action_model_input.shape[-3],
+                    action_model_input.shape[-2],
+                    action_model_input.shape[-1],
+                    1, 1, frame_st_id, action=True,
+                ),
+                'text_emb': self._get_model_prompt_embeds(),
+                'text_hidden_states': self._get_model_prompt_text_hidden_states(),
             }
 
             if action_cond is not None:
@@ -440,6 +519,8 @@ class VA_Server:
                 device=self.device,
                 dtype=self.dtype,
             )
+
+        self._refresh_model_input_cache()
 
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
         self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
