@@ -24,7 +24,13 @@ def main():
         "--config-name",
         choices=(
             "nmx_chip_train",
+            "nmx_chip_train_fastwam",
+            "nmx_chip_train_mot_idm",
+            "nmx_chip_train_mot_fastwam",
+            "nmx_chip_train_mot_per_view_pad_idm",
+            "nmx_chip_train_mot_per_view_pad_fastwam",
             "nmx_chip_train_per_view_pad",
+            "nmx_chip_train_per_view_pad_fastwam",
             "nmx_chip_episode109_overfit",
         ),
         default="nmx_chip_train",

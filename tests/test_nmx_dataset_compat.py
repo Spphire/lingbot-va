@@ -261,6 +261,26 @@ def test_model_structure_and_action_condition_form_independent_matrix():
         assert candidate == reference
 
 
+def test_mot_per_view_pad_configs_complete_the_visual_matrix():
+    configs = {
+        ("mot", "inverse_dynamics"): VA_CONFIGS[
+            "nmx_chip_train_mot_per_view_pad_idm"
+        ],
+        ("mot", "fastwam"): VA_CONFIGS[
+            "nmx_chip_train_mot_per_view_pad_fastwam"
+        ],
+    }
+
+    for (structure, action_mode), config in configs.items():
+        assert config.model_structure == structure
+        assert config.action_condition_mode == action_mode
+        assert config.visual_contract == PER_VIEW_ZERO_PAD_VISUAL_CONTRACT
+        assert config.visual_tokens_per_frame == 160
+        assert list(config.latent_canvas_hwc) == [20, 32, 48]
+        assert config.expected_latent_view_shapes == [(20, 15), (20, 15)]
+        assert config.mot_config["action_hidden_dim"] == 768
+
+
 def test_text_embedding_override_is_loaded_once_and_replaces_cached_text(tmp_path):
     override = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
     override_path = tmp_path / "prompt_text_emb.pt"

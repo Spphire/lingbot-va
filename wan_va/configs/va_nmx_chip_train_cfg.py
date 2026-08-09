@@ -187,6 +187,19 @@ va_nmx_chip_train_mot_idm_cfg.__name__ = "Config: NMX chip train, MoT IDM"
 va_nmx_chip_train_mot_idm_cfg.model_structure = "mot"
 va_nmx_chip_train_mot_idm_cfg.mot_config = deepcopy(_NMX_MOT_CONFIG)
 
+# MoT uses the same visual-only per-view padding contract as the shared
+# backbone. Keep a distinct native config so checkpoint loading fails closed
+# on both architecture and latent geometry instead of reusing the baseline
+# 20x30 canvas.
+va_nmx_chip_train_mot_per_view_pad_idm_cfg = deepcopy(
+    va_nmx_chip_train_per_view_pad_cfg
+)
+va_nmx_chip_train_mot_per_view_pad_idm_cfg.__name__ = (
+    "Config: NMX chip train, MoT per-view padding, IDM"
+)
+va_nmx_chip_train_mot_per_view_pad_idm_cfg.model_structure = "mot"
+va_nmx_chip_train_mot_per_view_pad_idm_cfg.mot_config = deepcopy(_NMX_MOT_CONFIG)
+
 va_nmx_chip_train_mot_fastwam_cfg = deepcopy(va_nmx_chip_train_fastwam_cfg)
 va_nmx_chip_train_mot_fastwam_cfg.__name__ = (
     "Config: NMX chip train, MoT FastWAM"
@@ -246,6 +259,15 @@ va_nmx_chip_train_per_view_pad_fastwam_cfg.__name__ = (
     "Config: NMX chip train, per-view padding, FastWAM action conditioning"
 )
 va_nmx_chip_train_per_view_pad_fastwam_cfg.action_condition_mode = "fastwam"
+
+va_nmx_chip_train_mot_per_view_pad_fastwam_cfg = deepcopy(
+    va_nmx_chip_train_per_view_pad_fastwam_cfg
+)
+va_nmx_chip_train_mot_per_view_pad_fastwam_cfg.__name__ = (
+    "Config: NMX chip train, MoT per-view padding, FastWAM action conditioning"
+)
+va_nmx_chip_train_mot_per_view_pad_fastwam_cfg.model_structure = "mot"
+va_nmx_chip_train_mot_per_view_pad_fastwam_cfg.mot_config = deepcopy(_NMX_MOT_CONFIG)
 
 
 va_nmx_chip_episode109_overfit_cfg = deepcopy(va_nmx_chip_train_cfg)
