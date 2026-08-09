@@ -71,6 +71,8 @@ class VA_Server:
             torch_device='cpu' if self.enable_offload else self.device,
         )
         self.streaming_vae = WanVAEStreamingWrapper(self.vae)
+        if getattr(job_config, "compile_vae_encoder", False) and self.device.type == "cuda":
+            self.streaming_vae.compile_encoder(mode="reduce-overhead")
 
         self.tokenizer = load_tokenizer(
             os.path.join(job_config.wan22_pretrained_model_name_or_path,
@@ -97,6 +99,17 @@ class VA_Server:
                                             device=self.device,
                                             eval_mode=True,
                                             )
+        if getattr(job_config, "compile_transformer", False) and self.device.type == "cuda":
+            if hasattr(self.transformer, "compile_blocks"):
+                mode = str(getattr(job_config, "compile_transformer_mode", "default"))
+                if mode in {"reduce-overhead", "max-autotune"}:
+                    logger.warning(
+                        "Using compile_transformer_mode=default for chained KV blocks"
+                    )
+                    mode = "default"
+                self.transformer.compile_blocks(mode=mode, dynamic=True)
+            else:
+                logger.warning("Transformer does not expose compile_blocks")
 
         self.env_type = job_config.env_type
         self.streaming_vae_half = None
@@ -108,6 +121,15 @@ class VA_Server:
                 torch_device='cpu' if self.enable_offload else self.device,
             )
             self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
+            if getattr(job_config, "compile_vae_encoder", False) and self.device.type == "cuda":
+                self.streaming_vae_half.compile_encoder(mode="reduce-overhead")
+
+        if getattr(job_config, "enable_perf_backends", False) and self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            logger.warning("Enabled process-wide cuDNN benchmark and TF32")
 
     def _get_t5_prompt_embeds(
         self,
