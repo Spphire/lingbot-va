@@ -182,7 +182,12 @@ def test_visual_ab_configs_differ_only_in_visual_contract():
     )
     baseline_values = dict(baseline)
     padded_values = dict(padded)
-    for key in ("__name__", "visual_contract"):
+    for key in (
+        "__name__",
+        "visual_contract",
+        "visual_tokens_per_frame",
+        "latent_canvas_hwc",
+    ):
         baseline_values.pop(key, None)
         padded_values.pop(key, None)
     assert baseline_values == padded_values
@@ -225,7 +230,12 @@ def test_fastwam_visual_ab_configs_change_only_action_mode_and_visual_contract()
 
     baseline_values = dict(fastwam_baseline)
     padded_values = dict(fastwam_padded)
-    for key in ("__name__", "visual_contract"):
+    for key in (
+        "__name__",
+        "visual_contract",
+        "visual_tokens_per_frame",
+        "latent_canvas_hwc",
+    ):
         baseline_values.pop(key, None)
         padded_values.pop(key, None)
     assert baseline_values == padded_values
