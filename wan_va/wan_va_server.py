@@ -36,7 +36,7 @@ from utils import (
     run_async_server_mode,
     save_async,
 )
-from inference_modes import resolve_use_cfg, resolve_video_run_mode
+from inference_modes import resolve_video_run_mode
 
 
 class VA_Server:
@@ -478,12 +478,7 @@ class VA_Server:
 
     def _reset(self, prompt=None):
         logger.info('Reset.')
-        self.use_cfg = resolve_use_cfg(
-            getattr(self.job_config, "action_condition_mode", "inverse_dynamics"),
-            getattr(self.job_config, "fastwam_video_run_mode", False),
-            self.job_config.guidance_scale,
-            self.job_config.action_guidance_scale,
-        )
+        self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
         #### Reset all parameters
         self.frame_st_id = 0
         self.init_latent = None
