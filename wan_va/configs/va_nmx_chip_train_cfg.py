@@ -256,6 +256,42 @@ va_nmx_fold_towel_train_fastwam_cfg.mot_config = {}
 va_nmx_fold_towel_train_fastwam_cfg.save_interval = 1000
 
 
+# Gift-box task config. The correction and full-trajectory datasets all belong
+# to one deployment task, so every segment uses the same prompt embedding and
+# the same group-level action normalizer.
+va_nmx_gift_box_train_fastwam_cfg = deepcopy(va_nmx_chip_train_fastwam_cfg)
+va_nmx_gift_box_train_fastwam_cfg.__name__ = (
+    "Config: NMX gift box train, shared FastWAM, upstream single-canvas"
+)
+va_nmx_gift_box_train_fastwam_cfg.dataset_path = [
+    "/mnt/dataset/gift_clamp_gift_20260803",
+    "/mnt/dataset/gift_failing_clamping_gift_correction_20260803",
+    "/mnt/dataset/gift_missing_box_correction_20260803",
+    "/mnt/dataset/gift_overall_20260803",
+    "/mnt/dataset/cover_lid_failing_clamping_lid_20260729",
+    "/mnt/dataset/cover_lid_overall_20260729",
+    "/mnt/dataset/cover_lid_push_lid_20260729",
+]
+va_nmx_gift_box_train_fastwam_cfg.empty_emb_path = (
+    "/mnt/dataset/gift_overall_20260803/empty_emb.pt"
+)
+va_nmx_gift_box_train_fastwam_cfg.text_emb_override_path = (
+    "/mnt/workspace/shenyibo/lingbot-va-assets/gift_box_20260803/"
+    "prompt_text_emb.pt"
+)
+va_nmx_gift_box_train_fastwam_cfg.text_emb_override_sha256 = (
+    "603de64c1f0a71971fb30af1364bd870dbbd1cb5cb31887d6ffad854df1bfb27"
+)
+va_nmx_gift_box_train_fastwam_cfg.task_prompt_override = (
+    "Pack the gift and slide the lid to lock"
+)
+va_nmx_gift_box_train_fastwam_cfg.action_norm_stats_path = (
+    "/mnt/workspace/shenyibo/lingbot-va-assets/gift_box_20260803/"
+    "lingbot_action_norm_stats.json"
+)
+va_nmx_gift_box_train_fastwam_cfg.save_interval = 4000
+
+
 va_nmx_chip_train_per_view_pad_fastwam_cfg = deepcopy(
     va_nmx_chip_train_per_view_pad_cfg
 )
