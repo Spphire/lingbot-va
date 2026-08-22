@@ -182,19 +182,29 @@ def initialize_sequence_parallel(
         raise ValueError("Node-local sequence parallel requires LOCAL_WORLD_SIZE > 1.")
 
     sp_size = _parse_sp_size(size, local_world_size=local_world_size)
-    if sp_size != local_world_size:
+    if sp_size <= 1:
         raise ValueError(
-            "Node-local sequence parallel currently requires size=auto or "
-            f"size=LOCAL_WORLD_SIZE ({local_world_size}), got {sp_size}."
+            f"Sequence parallel size must be greater than 1, got {sp_size}."
+        )
+    if sp_size > local_world_size or local_world_size % sp_size != 0:
+        raise ValueError(
+            "Node-local sequence parallel size must divide LOCAL_WORLD_SIZE: "
+            f"size={sp_size}, local_world_size={local_world_size}."
         )
     if world_size % sp_size != 0:
         raise ValueError(
             f"WORLD_SIZE ({world_size}) must be divisible by sequence_parallel size ({sp_size})."
         )
-    if rank % sp_size != local_rank:
+    if world_size % local_world_size != 0:
+        raise ValueError(
+            f"WORLD_SIZE ({world_size}) must be divisible by LOCAL_WORLD_SIZE "
+            f"({local_world_size}) for node-local sequence parallel."
+        )
+    if rank % local_world_size != local_rank:
         raise ValueError(
             "Node-local sequence parallel assumes contiguous ranks per node: "
-            f"rank={rank}, local_rank={local_rank}, sp_size={sp_size}."
+            f"rank={rank}, local_rank={local_rank}, "
+            f"local_world_size={local_world_size}."
         )
 
     selected_group = None
@@ -214,7 +224,7 @@ def initialize_sequence_parallel(
         mode=mode,
         scope=scope,
         size=sp_size,
-        rank=local_rank,
+        rank=local_rank % sp_size,
         world_size=world_size,
         local_rank=local_rank,
         local_world_size=local_world_size,

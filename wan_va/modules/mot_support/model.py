@@ -867,7 +867,11 @@ class FlexAttnFunc(nn.Module):
         flex_attention,
         dynamic=True,
     )
-    compiled_create_block_mask: ClassVar[Callable] = torch.compile(create_block_mask)
+    # The compiled mask builder can select an invalid Triton XBLOCK for the
+    # long packed sequences used by the full NOE mixture. Mask construction is
+    # a one-time startup operation, so keep it eager and reserve compilation
+    # for the attention kernel itself.
+    create_block_mask_func: ClassVar[Callable] = create_block_mask
     mask_block_size: ClassVar[int] = 64
     attention_mask: ClassVar[BlockMask] = None
     cross_attention_mask: ClassVar[BlockMask] = None
@@ -1058,7 +1062,7 @@ class FlexAttnFunc(nn.Module):
             action_condition_mode=action_condition_mode,
             attention_piece_ids=attn_piece_ids,
         )
-        block_mask = FlexAttnFunc.compiled_create_block_mask(
+        block_mask = FlexAttnFunc.create_block_mask_func(
             mask_mod,
             1,
             1,
@@ -1066,7 +1070,6 @@ class FlexAttnFunc(nn.Module):
             len(seq_ids),
             device=device,
             BLOCK_SIZE=FlexAttnFunc.mask_block_size,
-            _compile=True,
         )
         FlexAttnFunc.attention_mask = block_mask
 
@@ -1082,7 +1085,7 @@ class FlexAttnFunc(nn.Module):
             piece_ids=piece_ids,
             text_piece_ids=text_piece_ids,
         )
-        block_mask_cross = FlexAttnFunc.compiled_create_block_mask(
+        block_mask_cross = FlexAttnFunc.create_block_mask_func(
             mask_mod_cross,
             1,
             1,
@@ -1090,7 +1093,6 @@ class FlexAttnFunc(nn.Module):
             len(text_seq_ids),
             device=device,
             BLOCK_SIZE=FlexAttnFunc.mask_block_size,
-            _compile=True,
         )
         FlexAttnFunc.cross_attention_mask = block_mask_cross
         FlexAttnFunc.cross_attention_seq_ids = seq_ids.long().to(device)
@@ -1141,7 +1143,7 @@ class FlexAttnFunc(nn.Module):
             piece_ids=piece_ids,
             text_piece_ids=text_piece_ids,
         )
-        FlexAttnFunc.cross_attention_mask = FlexAttnFunc.compiled_create_block_mask(
+        FlexAttnFunc.cross_attention_mask = FlexAttnFunc.create_block_mask_func(
             mask_mod_cross,
             1,
             1,
@@ -1149,7 +1151,6 @@ class FlexAttnFunc(nn.Module):
             int(text_seq_ids.shape[0]),
             device=device,
             BLOCK_SIZE=FlexAttnFunc.mask_block_size,
-            _compile=True,
         )
 
     @staticmethod
